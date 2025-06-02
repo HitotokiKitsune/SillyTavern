@@ -6328,24 +6328,45 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
         oai_settings.deepseek_parallel_generations > 1) {
 
-        allGeneratedMessages = data.choices.map(choice =>
-            (choice.message && typeof choice.message.content === 'string') ? choice.message.content : ''
-        );
+        allGeneratedMessages = data.choices.map(choice_item => {
+            // 'choice_item' is one of the full response objects from DeepSeek as packaged by sendOpenAIRequest
+            if (choice_item && choice_item.choices && choice_item.choices[0] &&
+                choice_item.choices[0].message && typeof choice_item.choices[0].message.content === 'string') {
+                return choice_item.choices[0].message.content;
+            }
+            // Fallback for the structure prepared by openai.js if the above direct path fails
+            else if (choice_item && choice_item.message && typeof choice_item.message.content === 'string') {
+                 return choice_item.message.content;
+            }
+            console.warn('DeepSeek parallel choice content not found in expected path. Choice object:', JSON.parse(JSON.stringify(choice_item)));
+            return ''; // Return empty string if content not found
+        });
         // Ensure getMessage for the primary display is the first valid message
-        getMessage = allGeneratedMessages.find(msg => msg.trim() !== '') || allGeneratedMessages[0] || '';
+        getMessage = allGeneratedMessages.find(msg => msg && msg.trim() !== '') || allGeneratedMessages[0] || '';
+
+        if (allGeneratedMessages.every(msg => msg === '')) {
+            console.error('All generated messages for DeepSeek parallel were empty after extraction. Original data.choices:', JSON.parse(JSON.stringify(data.choices)));
+            // Consider adding a user-facing toastr error here if this state is reached.
+            // toastr.error("Failed to extract content from DeepSeek's parallel responses.");
+        } else {
+            console.log('allGeneratedMessages for DeepSeek parallel:', JSON.parse(JSON.stringify(allGeneratedMessages)));
+        }
         // Swipes will be handled by the main logic that processes allGeneratedMessages later.
-        // We don't need to set the global `swipes` variable here as it's for extra swipes beyond data.choices.
-        // Instead, the `chat[currentMessageIndex]['swipes'] = allGeneratedMessages;` line later will handle this.
 
         // Populate allGeneratedExtras if openai.js added specific extra data per choice
-        allGeneratedExtras = data.choices.map(choice => {
-            const choiceExtra = { ... (choice.extra || {}) }; // Start with any 'extra' already on the choice
-            if (choice.model) choiceExtra.model = choice.model;
-            if (choice.api) choiceExtra.api = choice.api; // Though api should be deepseek for all
-            // If 'usage' or 'token_count' is available per choice from openai.js
-            if (choice.token_count) choiceExtra.token_count = choice.token_count;
-            else if (choice.usage && choice.usage.completion_tokens) choiceExtra.token_count = choice.usage.completion_tokens;
-            return choiceExtra;
+        allGeneratedExtras = data.choices.map(choice_item => {
+            const extra = { ...(choice_item.extra || {}) };
+            if (choice_item && choice_item.choices && choice_item.choices[0] &&
+                choice_item.choices[0].message && typeof choice_item.choices[0].message.reasoning_content === 'string') {
+                extra.reasoning = choice_item.choices[0].message.reasoning_content;
+            } else if (choice_item && choice_item.message && typeof choice_item.message.reasoning_content === 'string') {
+                extra.reasoning = choice_item.message.reasoning_content;
+            }
+            // Include other metadata if present on choice_item (which is the full individual response)
+            extra.api = choice_item.api || getGeneratingApi();
+            extra.model = choice_item.model || getGeneratingModel();
+            extra.token_count = choice_item.usage?.completion_tokens || choice_item.token_count || 0;
+            return extra;
         });
 
     } else if (main_api === 'openai' && Array.isArray(data?.choices) && data.choices.length > 1) {
@@ -6457,8 +6478,31 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         chat[currentMessageIndex]['send_date'] = getMessageTimeStamp();
         chat[currentMessageIndex]['extra']['api'] = getGeneratingApi();
         chat[currentMessageIndex]['extra']['model'] = getGeneratingModel();
-        chat[currentMessageIndex]['extra']['reasoning'] = reasoning;
+        chat[currentMessageIndex]['extra']['reasoning'] = reasoning; // Base reasoning for the message
         chat[currentMessageIndex]['extra']['reasoning_duration'] = null;
+
+        // For DeepSeek parallel, set reasoning and token_count from the primary choice
+        if (Array.isArray(data?.choices) && data.choices.length > 0 &&
+            oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
+            oai_settings.deepseek_parallel_generations > 1) {
+            const primaryChoice = data.choices && data.choices[0];
+            if (primaryChoice && primaryChoice.choices && primaryChoice.choices[0] && primaryChoice.choices[0].message) {
+                chat[currentMessageIndex]['extra']['reasoning'] = primaryChoice.choices[0].message.reasoning_content || reasoning || '';
+            } else if (primaryChoice && primaryChoice.message && primaryChoice.message.reasoning_content) {
+                chat[currentMessageIndex]['extra']['reasoning'] = primaryChoice.message.reasoning_content || reasoning || '';
+            }
+            // Ensure token_count for the primary message is also set
+            if (primaryChoice && primaryChoice.usage && primaryChoice.usage.completion_tokens !== undefined) {
+                chat[currentMessageIndex]['extra']['token_count'] = primaryChoice.usage.completion_tokens;
+            } else if (primaryChoice && primaryChoice.token_count !== undefined) {
+                 chat[currentMessageIndex]['extra']['token_count'] = primaryChoice.token_count;
+            }
+        } else if (power_user.message_token_count_enabled) { // Standard token counting
+            const tokenCountText = (reasoning || '') + getMessage; // getMessage is already primary here
+            chat[currentMessageIndex]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
+        }
+
+
         if (power_user.trim_spaces) {
             getMessage = getMessage.trim();
         }
@@ -6466,11 +6510,6 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         chat[currentMessageIndex]['title'] = title;
         chat[currentMessageIndex]['gen_started'] = generation_started;
         chat[currentMessageIndex]['gen_finished'] = generationFinished;
-
-        if (power_user.message_token_count_enabled) {
-            const tokenCountText = (reasoning || '') + chat[currentMessageIndex]['mes'];
-            chat[currentMessageIndex]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
-        }
 
         if (selected_group) {
             console.debug('entering chat update for groups');
