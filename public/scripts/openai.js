@@ -2306,25 +2306,27 @@ async function sendOpenAIRequest(type, messages, signal) {
 
     const generate_url = '/api/backends/chat-completions/generate';
 
+    // START DEEPSEEK PARALLEL GENERATION
     if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && oai_settings.deepseek_parallel_generations > 1 && !isQuiet) {
         const numGenerations = oai_settings.deepseek_parallel_generations;
         const promises = [];
         // Remove 'n' from generate_data if it exists, as we're handling parallelism client-side
         const singleGenerateData = { ...generate_data };
-        delete singleGenerateData.n;
+        delete singleGenerateData.n; // 'n' is for backend parallel, we do client parallel here
+        delete singleGenerateData.stream; // Ensure streaming is off for parallel non-streamed calls
 
         for (let i = 0; i < numGenerations; i++) {
             promises.push(
                 fetch(generate_url, {
                     method: 'POST',
-                    body: JSON.stringify(singleGenerateData), // Send the same prompt
+                    body: JSON.stringify(singleGenerateData), // Send the same prompt configuration
                     headers: getRequestHeaders(),
                     signal: signal, // Use the same signal for all requests
                 }).then(response => {
                     if (!response.ok) {
                         return response.text().then(text => {
-                            tryParseStreamingError(response, text);
-                            throw new Error(`Got response status ${response.status}`);
+                            tryParseStreamingError(response, text, { quiet: false }); // Show errors for individual requests
+                            throw new Error(`Got response status ${response.status} for parallel request ${i + 1}`);
                         });
                     }
                     return response.json();
@@ -2333,27 +2335,69 @@ async function sendOpenAIRequest(type, messages, signal) {
         }
 
         return Promise.all(promises).then(results => {
-            const combinedResult = { ...results[0] };
+            // results is an array of individual JSON responses from DeepSeek
+            const combinedResult = {};
 
-            if (!Array.isArray(combinedResult.choices)) {
-                combinedResult.choices = results.map((res, index) => ({
-                    message: res.choices?.[0]?.message || res.message || { content: extractMessageFromData(res, chat_completion_sources.DEEPSEEK) },
-                    index: index,
-                    logprobs: res.choices?.[0]?.logprobs || res.logprobs || null,
-                    finish_reason: res.choices?.[0]?.finish_reason || res.finish_reason || 'stop',
-                }));
-            } else {
-                 combinedResult.choices = results.flatMap((res, resultIndex) =>
-                    (res.choices || [{ message: { content: extractMessageFromData(res, chat_completion_sources.DEEPSEEK) }, index: 0, logprobs: null, finish_reason: 'stop' }])
-                    .map((choice, choiceIndex) => ({
-                        ...choice,
-                        index: resultIndex * (res.choices?.length || 1) + choiceIndex,
-                    }))
-                );
+            // Use the first result as a template for top-level fields, if available and valid.
+            const firstValidResult = results.find(r => r && typeof r === 'object');
+            if (firstValidResult) {
+                combinedResult.id = firstValidResult.id || `ds-parallel-${Date.now()}`;
+                combinedResult.model = firstValidResult.model || oai_settings.deepseek_model;
+                combinedResult.object = firstValidResult.object || "chat.completion";
+                combinedResult.created = firstValidResult.created || Math.floor(Date.now() / 1000);
+                // Copy usage if present and makes sense (summing might be complex, maybe take first?)
+                if (firstValidResult.usage) {
+                    combinedResult.usage = firstValidResult.usage;
+                }
+            } else { // Fallback if no valid results
+                combinedResult.id = `ds-parallel-fallback-${Date.now()}`;
+                combinedResult.model = oai_settings.deepseek_model;
+                combinedResult.object = "chat.completion";
+                combinedResult.created = Math.floor(Date.now() / 1000);
             }
+
+            combinedResult.choices = results.map((individualDeepSeekResponse, index) => {
+                // Ensure individualDeepSeekResponse is an object before trying to access its properties
+                const responseData = (individualDeepSeekResponse && typeof individualDeepSeekResponse === 'object') ? individualDeepSeekResponse : {};
+
+                // Extract message content using the global extractMessageFromData.
+                // Pass chat_completion_sources.DEEPSEEK for provider-specific logic.
+                const messageContent = extractMessageFromData(responseData, chat_completion_sources.DEEPSEEK);
+
+                // Construct a choice object compatible with how script.js (saveReply) processes choices.
+                // It needs to find message.content.
+                return {
+                    // Spread the original response to make all its fields available if needed by other parts of the system
+                    ...responseData,
+                    message: {
+                        // Ensure .message.content structure exists, as saveReply/extractMessageFromData might look for it
+                        content: messageContent,
+                        // DeepSeek might also return 'role', so preserve it if present
+                        role: responseData.choices?.[0]?.message?.role || responseData.message?.role || 'assistant',
+                    },
+                    index: index, // Standard field for choices array
+                    // Preserve logprobs and finish_reason. Adapt to DeepSeek's actual response structure.
+                    // Common patterns: directly on response, or within response.choices[0]
+                    logprobs: responseData.logprobs || responseData.choices?.[0]?.logprobs || null,
+                    finish_reason: responseData.finish_reason || responseData.choices?.[0]?.finish_reason || 'stop',
+                };
+            });
+
+            // The calling function (e.g., in script.js that calls sendOpenAIRequest)
+            // will use this combinedResult. Its `choices` array will be iterated by `saveReply`.
             return combinedResult;
+        }).catch(error => {
+            // Handle errors from Promise.all (e.g., if one of the fetches fails network-wise or gets aborted)
+            console.error("Error in DeepSeek parallel generation:", error);
+            // Potentially re-throw or return an error structure that the UI can handle
+            // For now, let it propagate, or create a combined error response.
+            // This could be a single error object indicating partial or total failure.
+            // For simplicity, rethrowing. The UI should have try/catch around Generate().
+            throw error;
         });
-    } else {
+    }
+    // END DEEPSEEK PARALLEL GENERATION
+    else { // Original fetch call or other providers
         const response = await fetch(generate_url, {
             method: 'POST',
             body: JSON.stringify(generate_data),

@@ -6320,23 +6320,47 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
     // Handle data which is the actual response from sendOpenAIRequest
     // data.choices may exist for OpenAI 'n' > 1 or DeepSeek parallel generations
     let allGeneratedMessages = [];
-    let allGeneratedExtras = []; // To store 'extra' info for each swipe if needed for DeepSeek
+    let allGeneratedExtras = []; // To store 'extra' info for each swipe.
 
-    if (main_api === 'openai' && oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && Array.isArray(data?.choices) && data.choices.length > 0 && oai_settings.deepseek_parallel_generations > 1) {
-        // This indicates parallel generations from DeepSeek
-        allGeneratedMessages = data.choices.map(choice => extractMessageFromData({ choices: [choice] }, oai_settings.chat_completion_source));
-        // For DeepSeek client-side parallel, 'extra' data might be mostly similar.
-        // If unique data per choice were available (it isn't directly from client-side fetch-all), it would be handled here.
-        // For now, we'll use a common base extra for all swipes derived from the primary message.
-        getMessage = allGeneratedMessages[0]; // The first message to display initially
-        swipes = allGeneratedMessages.slice(1); // Remaining messages become swipes
+    //订单修补
+    //Conditional block for DeepSeek parallel generations
+    if (Array.isArray(data?.choices) && data.choices.length > 1 &&
+        oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
+        oai_settings.deepseek_parallel_generations > 1) {
+
+        allGeneratedMessages = data.choices.map(choice =>
+            (choice.message && typeof choice.message.content === 'string') ? choice.message.content : ''
+        );
+        // Ensure getMessage for the primary display is the first valid message
+        getMessage = allGeneratedMessages.find(msg => msg.trim() !== '') || allGeneratedMessages[0] || '';
+        // Swipes will be handled by the main logic that processes allGeneratedMessages later.
+        // We don't need to set the global `swipes` variable here as it's for extra swipes beyond data.choices.
+        // Instead, the `chat[currentMessageIndex]['swipes'] = allGeneratedMessages;` line later will handle this.
+
+        // Populate allGeneratedExtras if openai.js added specific extra data per choice
+        allGeneratedExtras = data.choices.map(choice => {
+            const choiceExtra = { ... (choice.extra || {}) }; // Start with any 'extra' already on the choice
+            if (choice.model) choiceExtra.model = choice.model;
+            if (choice.api) choiceExtra.api = choice.api; // Though api should be deepseek for all
+            // If 'usage' or 'token_count' is available per choice from openai.js
+            if (choice.token_count) choiceExtra.token_count = choice.token_count;
+            else if (choice.usage && choice.usage.completion_tokens) choiceExtra.token_count = choice.usage.completion_tokens;
+            return choiceExtra;
+        });
+
     } else if (main_api === 'openai' && Array.isArray(data?.choices) && data.choices.length > 1) {
         // This handles existing 'n' > 1 functionality for other providers (like OpenAI native)
         allGeneratedMessages = data.choices.map(choice => choice.message.content);
-        getMessage = allGeneratedMessages[0];
-        swipes = allGeneratedMessages.slice(1);
+        getMessage = allGeneratedMessages[0]; // First message is primary
+        // swipes variable is for additional swipes beyond data.choices, so we don't directly assign here.
+        // The logic later will use allGeneratedMessages for the main message's swipes array.
+        allGeneratedExtras = data.choices.map(choice => ({ // Basic extra info for OpenAI 'n'
+            model: data.model || getGeneratingModel(),
+            api: data.api || getGeneratingApi(),
+            // token_count for OpenAI 'n' is usually for the whole request, not per choice.
+        }));
     }
-    // else: getMessage remains as initially passed, and swipes are as passed or empty.
+    // else: getMessage remains as initially passed, and the global `swipes` variable (passed as param) is used.
 
     if (chat.length && (!chat[chat.length - 1]['extra'] || typeof chat[chat.length - 1]['extra'] !== 'object')) {
         chat[chat.length - 1]['extra'] = {};
@@ -6465,21 +6489,41 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         if (allGeneratedMessages.length > 0) {
             chat[currentMessageIndex]['swipes'] = allGeneratedMessages;
             chat[currentMessageIndex]['swipe_id'] = 0;
+
+            // Ensure swipe_info is initialized
             if (!Array.isArray(chat[currentMessageIndex]['swipe_info'])) {
                 chat[currentMessageIndex]['swipe_info'] = [];
             }
-            const baseExtra = JSON.parse(JSON.stringify(chat[currentMessageIndex]['extra'] || {}));
+
+            // Use the 'extra' from the main message object as the base for all swipes.
+            const baseExtraForSwipes = JSON.parse(JSON.stringify(chat[currentMessageIndex]['extra'] || {}));
+            // Add API and model from the main data object if not already in baseExtra
+            // (data.api and data.model are populated by openai.js for DeepSeek parallel)
+            if (!baseExtraForSwipes.api) baseExtraForSwipes.api = data.api || getGeneratingApi();
+            if (!baseExtraForSwipes.model) baseExtraForSwipes.model = data.model || getGeneratingModel();
+
             allGeneratedMessages.forEach((msgContent, index) => {
-                // For client-side parallel, allGeneratedExtras might be empty or contain minimal differentiation.
-                // The main 'extra' from the first response is usually sufficient as a base.
-                if (!chat[currentMessageIndex]['swipe_info'][index]) {
-                    chat[currentMessageIndex]['swipe_info'][index] = {
-                        send_date: chat[currentMessageIndex]['send_date'],
-                        gen_started: chat[currentMessageIndex]['gen_started'],
-                        gen_finished: chat[currentMessageIndex]['gen_finished'],
-                        extra: { ...baseExtra, ...(allGeneratedExtras[index] || {}) },
-                    };
+                // Start with a copy of the base extra data
+                let choiceSpecificExtra = { ...baseExtraForSwipes };
+
+                // If allGeneratedExtras has specific data for this choice, merge it
+                if (allGeneratedExtras[index] && typeof allGeneratedExtras[index] === 'object') {
+                    choiceSpecificExtra = { ...choiceSpecificExtra, ...allGeneratedExtras[index] };
                 }
+
+                // Ensure essential fields like api and model are present, falling back if needed
+                if (!choiceSpecificExtra.api) choiceSpecificExtra.api = data.choices?.[index]?.api || baseExtraForSwipes.api;
+                if (!choiceSpecificExtra.model) choiceSpecificExtra.model = data.choices?.[index]?.model || baseExtraForSwipes.model;
+                if (data.choices?.[index]?.token_count) choiceSpecificExtra.token_count = data.choices[index].token_count;
+                else if (data.choices?.[index]?.usage?.completion_tokens) choiceSpecificExtra.token_count = data.choices[index].usage.completion_tokens;
+
+
+                chat[currentMessageIndex]['swipe_info'][index] = {
+                    send_date: chat[currentMessageIndex]['send_date'],
+                    gen_started: chat[currentMessageIndex]['gen_started'],
+                    gen_finished: chat[currentMessageIndex]['gen_finished'],
+                    extra: choiceSpecificExtra,
+                };
             });
         } else if (chat[currentMessageIndex]['swipes'] === undefined) { // Standard single response
             chat[currentMessageIndex]['swipes'] = [getMessage];
