@@ -660,6 +660,20 @@
                                         <input type="number" id="n_openai" name="n_openai" class="text_pole" min="1" value="1">
                                     </div>
                                 </div>
+                                <div id="deepseek_parallel_generations_block" class="range-block" data-source="deepseek" style="display: none;">
+                                    <div class="range-block-title" data-i18n="Parallel Generations (DeepSeek)">
+                                        Parallel Generations (DeepSeek)
+                                        <div class="fa-solid fa-circle-info opacity50p" title="Number of identical prompts to send concurrently to DeepSeek (1-5). API 'n' parameter is not used." data-i18n="[title]Number of identical prompts to send concurrently to DeepSeek (1-5). API 'n' parameter is not used."></div>
+                                    </div>
+                                    <div class="range-block-range-and-counter">
+                                        <div class="range-block-range">
+                                            <input type="range" id="deepseek_parallel_generations_slider" class="neo-range-slider" name="deepseek_parallel_generations_slider" min="1" max="5" step="1">
+                                        </div>
+                                        <div class="range-block-counter">
+                                            <input type="number" id="deepseek_parallel_generations" class="neo-range-input" name="deepseek_parallel_generations" min="1" max="5" step="1" data-for="deepseek_parallel_generations_slider">
+                                        </div>
+                                    </div>
+                                </div>
                                 <div data-source="openrouter" class="range-block">
                                     <div class="range-block-title" title="Allow compressing requests by removing messages from the middle of the prompt.">
                                         <span data-i18n="Middle-out Transform">Middle-out Transform</span>

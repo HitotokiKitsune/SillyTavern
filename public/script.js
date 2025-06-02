@@ -6317,6 +6317,27 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         type = 'normal';
     }
 
+    // Handle data which is the actual response from sendOpenAIRequest
+    // data.choices may exist for OpenAI 'n' > 1 or DeepSeek parallel generations
+    let allGeneratedMessages = [];
+    let allGeneratedExtras = []; // To store 'extra' info for each swipe if needed for DeepSeek
+
+    if (main_api === 'openai' && oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && Array.isArray(data?.choices) && data.choices.length > 0 && oai_settings.deepseek_parallel_generations > 1) {
+        // This indicates parallel generations from DeepSeek
+        allGeneratedMessages = data.choices.map(choice => extractMessageFromData({ choices: [choice] }, oai_settings.chat_completion_source));
+        // For DeepSeek client-side parallel, 'extra' data might be mostly similar.
+        // If unique data per choice were available (it isn't directly from client-side fetch-all), it would be handled here.
+        // For now, we'll use a common base extra for all swipes derived from the primary message.
+        getMessage = allGeneratedMessages[0]; // The first message to display initially
+        swipes = allGeneratedMessages.slice(1); // Remaining messages become swipes
+    } else if (main_api === 'openai' && Array.isArray(data?.choices) && data.choices.length > 1) {
+        // This handles existing 'n' > 1 functionality for other providers (like OpenAI native)
+        allGeneratedMessages = data.choices.map(choice => choice.message.content);
+        getMessage = allGeneratedMessages[0];
+        swipes = allGeneratedMessages.slice(1);
+    }
+    // else: getMessage remains as initially passed, and swipes are as passed or empty.
+
     if (chat.length && (!chat[chat.length - 1]['extra'] || typeof chat[chat.length - 1]['extra'] !== 'object')) {
         chat[chat.length - 1]['extra'] = {};
     }
@@ -6334,6 +6355,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
     const generationFinished = new Date();
     const parsedImage = extractImageFromMessage(getMessage);
     getMessage = parsedImage.getMessage;
+
     if (type === 'swipe') {
         oldMessage = chat[chat.length - 1]['mes'];
         chat[chat.length - 1]['swipes'].length++;
@@ -6392,7 +6414,6 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         chat[chat.length - 1]['extra']['model'] = getGeneratingModel();
         chat[chat.length - 1]['extra']['reasoning'] += reasoning;
         await processImageAttachment(chat[chat.length - 1], { parsedImage, imageUrl });
-        // We don't know if the reasoning duration extended, so we don't update it here on purpose.
         if (power_user.message_token_count_enabled) {
             const tokenCountText = (reasoning || '') + chat[chat.length - 1]['mes'];
             chat[chat.length - 1]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
@@ -6402,28 +6423,29 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         addOneMessage(chat[chat_id], { type: 'swipe' });
         await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
 
-    } else {
+    } else { // Normal message display / first message of parallel set
         console.debug('entering chat update routine for non-swipe post');
         chat[chat.length] = {};
-        chat[chat.length - 1]['extra'] = {};
-        chat[chat.length - 1]['name'] = name2;
-        chat[chat.length - 1]['is_user'] = false;
-        chat[chat.length - 1]['send_date'] = getMessageTimeStamp();
-        chat[chat.length - 1]['extra']['api'] = getGeneratingApi();
-        chat[chat.length - 1]['extra']['model'] = getGeneratingModel();
-        chat[chat.length - 1]['extra']['reasoning'] = reasoning;
-        chat[chat.length - 1]['extra']['reasoning_duration'] = null;
+        const currentMessageIndex = chat.length - 1;
+        chat[currentMessageIndex]['extra'] = {};
+        chat[currentMessageIndex]['name'] = name2;
+        chat[currentMessageIndex]['is_user'] = false;
+        chat[currentMessageIndex]['send_date'] = getMessageTimeStamp();
+        chat[currentMessageIndex]['extra']['api'] = getGeneratingApi();
+        chat[currentMessageIndex]['extra']['model'] = getGeneratingModel();
+        chat[currentMessageIndex]['extra']['reasoning'] = reasoning;
+        chat[currentMessageIndex]['extra']['reasoning_duration'] = null;
         if (power_user.trim_spaces) {
             getMessage = getMessage.trim();
         }
-        chat[chat.length - 1]['mes'] = getMessage;
-        chat[chat.length - 1]['title'] = title;
-        chat[chat.length - 1]['gen_started'] = generation_started;
-        chat[chat.length - 1]['gen_finished'] = generationFinished;
+        chat[currentMessageIndex]['mes'] = getMessage;
+        chat[currentMessageIndex]['title'] = title;
+        chat[currentMessageIndex]['gen_started'] = generation_started;
+        chat[currentMessageIndex]['gen_finished'] = generationFinished;
 
         if (power_user.message_token_count_enabled) {
-            const tokenCountText = (reasoning || '') + chat[chat.length - 1]['mes'];
-            chat[chat.length - 1]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
+            const tokenCountText = (reasoning || '') + chat[currentMessageIndex]['mes'];
+            chat[currentMessageIndex]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
         }
 
         if (selected_group) {
@@ -6432,59 +6454,98 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             if (characters[this_chid].avatar != 'none') {
                 avatarImg = getThumbnailUrl('avatar', characters[this_chid].avatar);
             }
-            chat[chat.length - 1]['force_avatar'] = avatarImg;
-            chat[chat.length - 1]['original_avatar'] = characters[this_chid].avatar;
-            chat[chat.length - 1]['extra']['gen_id'] = group_generation_id;
+            chat[currentMessageIndex]['force_avatar'] = avatarImg;
+            chat[currentMessageIndex]['original_avatar'] = characters[this_chid].avatar;
+            chat[currentMessageIndex]['extra']['gen_id'] = group_generation_id;
         }
 
-        await processImageAttachment(chat[chat.length - 1], { parsedImage, imageUrl: imageUrl });
-        const chat_id = (chat.length - 1);
+        await processImageAttachment(chat[currentMessageIndex], { parsedImage, imageUrl: imageUrl });
 
-        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-        addOneMessage(chat[chat_id]);
-        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+        // Handle swipes for parallel generations or 'n' > 1 scenarios
+        if (allGeneratedMessages.length > 0) {
+            chat[currentMessageIndex]['swipes'] = allGeneratedMessages;
+            chat[currentMessageIndex]['swipe_id'] = 0;
+            if (!Array.isArray(chat[currentMessageIndex]['swipe_info'])) {
+                chat[currentMessageIndex]['swipe_info'] = [];
+            }
+            const baseExtra = JSON.parse(JSON.stringify(chat[currentMessageIndex]['extra'] || {}));
+            allGeneratedMessages.forEach((msgContent, index) => {
+                // For client-side parallel, allGeneratedExtras might be empty or contain minimal differentiation.
+                // The main 'extra' from the first response is usually sufficient as a base.
+                if (!chat[currentMessageIndex]['swipe_info'][index]) {
+                    chat[currentMessageIndex]['swipe_info'][index] = {
+                        send_date: chat[currentMessageIndex]['send_date'],
+                        gen_started: chat[currentMessageIndex]['gen_started'],
+                        gen_finished: chat[currentMessageIndex]['gen_finished'],
+                        extra: { ...baseExtra, ...(allGeneratedExtras[index] || {}) },
+                    };
+                }
+            });
+        } else if (chat[currentMessageIndex]['swipes'] === undefined) { // Standard single response
+            chat[currentMessageIndex]['swipes'] = [getMessage];
+            chat[currentMessageIndex]['swipe_id'] = 0;
+            chat[currentMessageIndex]['swipe_info'] = [{
+                send_date: chat[currentMessageIndex]['send_date'],
+                gen_started: chat[currentMessageIndex]['gen_started'],
+                gen_finished: chat[currentMessageIndex]['gen_finished'],
+                extra: JSON.parse(JSON.stringify(chat[currentMessageIndex]['extra'] || {})),
+            }];
+        }
+
+        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, currentMessageIndex, type);
+        addOneMessage(chat[currentMessageIndex]);
+        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, currentMessageIndex, type);
     }
 
+    // This block was originally outside the 'else' for normal messages,
+    // but it seems more appropriate to ensure it runs for all message types that modify/create the last message.
     const item = chat[chat.length - 1];
-    if (item['swipe_info'] === undefined) {
-        item['swipe_info'] = [];
-    }
-    if (item['swipe_id'] !== undefined) {
-        const swipeId = item['swipe_id'];
-        item['swipes'][swipeId] = item['mes'];
-        item['swipe_info'][swipeId] = {
-            send_date: item['send_date'],
-            gen_started: item['gen_started'],
-            gen_finished: item['gen_finished'],
-            extra: JSON.parse(JSON.stringify(item['extra'])),
-        };
-    } else {
-        item['swipe_id'] = 0;
-        item['swipes'] = [];
-        item['swipes'][0] = chat[chat.length - 1]['mes'];
-        item['swipe_info'][0] = {
-            send_date: chat[chat.length - 1]['send_date'],
-            gen_started: chat[chat.length - 1]['gen_started'],
-            gen_finished: chat[chat.length - 1]['gen_finished'],
-            extra: JSON.parse(JSON.stringify(chat[chat.length - 1]['extra'])),
-        };
-    }
+    if (item) { // Ensure item exists
+        if (item['swipe_info'] === undefined) {
+            item['swipe_info'] = [];
+        }
+        // If allGeneratedMessages were processed, swipes/swipe_info are already set up.
+        // Otherwise, ensure standard single message or existing swipes are correctly initialized.
+        if (allGeneratedMessages.length === 0) {
+            if (item['swipe_id'] !== undefined) { // Existing swipe being modified
+                const swipeId = item['swipe_id'];
+                item['swipes'][swipeId] = item['mes'];
+                item['swipe_info'][swipeId] = {
+                    send_date: item['send_date'],
+                    gen_started: item['gen_started'],
+                    gen_finished: item['gen_finished'],
+                    extra: JSON.parse(JSON.stringify(item['extra'])),
+                };
+            } else { // New single message
+                item['swipe_id'] = 0;
+                item['swipes'] = [item['mes']];
+                item['swipe_info'][0] = {
+                    send_date: item['send_date'],
+                    gen_started: item['gen_started'],
+                    gen_finished: item['gen_finished'],
+                    extra: JSON.parse(JSON.stringify(item['extra'])),
+                };
+            }
+        }
 
-    if (Array.isArray(swipes) && swipes.length > 0) {
-        const swipeInfoExtra = structuredClone(item.extra ?? {});
-        delete swipeInfoExtra.token_count;
-        delete swipeInfoExtra.reasoning;
-        delete swipeInfoExtra.reasoning_duration;
-        const swipeInfo = {
-            send_date: item.send_date,
-            gen_started: item.gen_started,
-            gen_finished: item.gen_finished,
-            extra: swipeInfoExtra,
-        };
-        const swipeInfoArray = Array(swipes.length).fill().map(() => structuredClone(swipeInfo));
-        parseReasoningInSwipes(swipes, swipeInfoArray, item.extra?.reasoning_duration);
-        item.swipes.push(...swipes);
-        item.swipe_info.push(...swipeInfoArray);
+        // Handle explicitly passed swipes (e.g., from non-DeepSeek 'n' > 1 or other mechanisms)
+        // This logic might be redundant if allGeneratedMessages already covers it, but kept for safety.
+        if (Array.isArray(swipes) && swipes.length > 0 && allGeneratedMessages.length === 0) {
+            const swipeInfoExtra = structuredClone(item.extra ?? {});
+            delete swipeInfoExtra.token_count;
+            delete swipeInfoExtra.reasoning;
+            delete swipeInfoExtra.reasoning_duration;
+            const swipeInfoBase = {
+                send_date: item.send_date,
+                gen_started: item.gen_started,
+                gen_finished: item.gen_finished,
+                extra: swipeInfoExtra,
+            };
+            const swipeInfoArray = Array(swipes.length).fill().map(() => structuredClone(swipeInfoBase));
+            parseReasoningInSwipes(swipes, swipeInfoArray, item.extra?.reasoning_duration);
+            item.swipes.push(...swipes); // Add to existing swipes
+            item.swipe_info.push(...swipeInfoArray);
+        }
     }
 
     statMesProcess(chat[chat.length - 1], type, characters, this_chid, oldMessage);
@@ -12336,6 +12397,19 @@ jQuery(async function () {
     $(document).on('click', '.open_characters_library', async function () {
         await getCharacters();
         await eventSource.emit(event_types.OPEN_CHARACTER_LIBRARY);
+    });
+
+    $('#deepseek_parallel_generations').on('input', function () {
+        const value = Number($(this).val());
+        oai_settings.deepseek_parallel_generations = value;
+        $('#deepseek_parallel_generations_slider').val(value);
+        saveSettingsDebounced();
+    });
+    $('#deepseek_parallel_generations_slider').on('input', function () {
+        const value = Number($(this).val());
+        oai_settings.deepseek_parallel_generations = value;
+        $('#deepseek_parallel_generations').val(value);
+        saveSettingsDebounced();
     });
 
     // Added here to prevent execution before script.js is loaded and get rid of quirky timeouts

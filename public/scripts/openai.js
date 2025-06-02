@@ -320,6 +320,7 @@ export const settingsToUpdate = {
     n: ['#n_openai', 'n', false, false],
     bypass_status_check: ['#openai_bypass_status_check', 'bypass_status_check', true, true],
     request_images: ['#openai_request_images', 'request_images', true, false],
+    deepseek_parallel_generations: ['#deepseek_parallel_generations', 'deepseek_parallel_generations', false, false],
 };
 
 const default_settings = {
@@ -403,6 +404,7 @@ const default_settings = {
     request_images: false,
     seed: -1,
     n: 1,
+    deepseek_parallel_generations: 1,
     bind_preset_to_connection: true,
 };
 
@@ -2303,68 +2305,118 @@ async function sendOpenAIRequest(type, messages, signal) {
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
 
     const generate_url = '/api/backends/chat-completions/generate';
-    const response = await fetch(generate_url, {
-        method: 'POST',
-        body: JSON.stringify(generate_data),
-        headers: getRequestHeaders(),
-        signal: signal,
-    });
 
-    if (!response.ok) {
-        tryParseStreamingError(response, await response.text());
-        throw new Error(`Got response status ${response.status}`);
-    }
-    if (stream) {
-        const eventStream = getEventSourceStream();
-        response.body.pipeThrough(eventStream);
-        const reader = eventStream.readable.getReader();
-        return async function* streamData() {
-            let text = '';
-            const swipes = [];
-            const toolCalls = [];
-            const state = { reasoning: '', image: '' };
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                const rawData = value.data;
-                if (rawData === '[DONE]') return;
-                tryParseStreamingError(response, rawData);
-                const parsed = JSON.parse(rawData);
+    if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && oai_settings.deepseek_parallel_generations > 1 && !isQuiet) {
+        const numGenerations = oai_settings.deepseek_parallel_generations;
+        const promises = [];
+        // Remove 'n' from generate_data if it exists, as we're handling parallelism client-side
+        const singleGenerateData = { ...generate_data };
+        delete singleGenerateData.n;
 
-                if (Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
-                    const swipeIndex = parsed.choices[0].index - 1;
-                    // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
-                } else {
-                    text += getStreamingReply(parsed, state);
-                }
+        for (let i = 0; i < numGenerations; i++) {
+            promises.push(
+                fetch(generate_url, {
+                    method: 'POST',
+                    body: JSON.stringify(singleGenerateData), // Send the same prompt
+                    headers: getRequestHeaders(),
+                    signal: signal, // Use the same signal for all requests
+                }).then(response => {
+                    if (!response.ok) {
+                        return response.text().then(text => {
+                            tryParseStreamingError(response, text);
+                            throw new Error(`Got response status ${response.status}`);
+                        });
+                    }
+                    return response.json();
+                })
+            );
+        }
 
-                ToolManager.parseToolCalls(toolCalls, parsed);
+        return Promise.all(promises).then(results => {
+            const combinedResult = { ...results[0] };
 
-                yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+            if (!Array.isArray(combinedResult.choices)) {
+                combinedResult.choices = results.map((res, index) => ({
+                    message: res.choices?.[0]?.message || res.message || { content: extractMessageFromData(res, chat_completion_sources.DEEPSEEK) },
+                    index: index,
+                    logprobs: res.choices?.[0]?.logprobs || res.logprobs || null,
+                    finish_reason: res.choices?.[0]?.finish_reason || res.finish_reason || 'stop',
+                }));
+            } else {
+                 combinedResult.choices = results.flatMap((res, resultIndex) =>
+                    (res.choices || [{ message: { content: extractMessageFromData(res, chat_completion_sources.DEEPSEEK) }, index: 0, logprobs: null, finish_reason: 'stop' }])
+                    .map((choice, choiceIndex) => ({
+                        ...choice,
+                        index: resultIndex * (res.choices?.length || 1) + choiceIndex,
+                    }))
+                );
             }
-        };
-    }
-    else {
-        const data = await response.json();
+            return combinedResult;
+        });
+    } else {
+        const response = await fetch(generate_url, {
+            method: 'POST',
+            body: JSON.stringify(generate_data),
+            headers: getRequestHeaders(),
+            signal: signal,
+        });
 
-        checkQuotaError(data);
-        checkModerationError(data);
-
-        if (data.error) {
-            const message = data.error.message || response.statusText || t`Unknown error`;
-            toastr.error(message, t`API returned an error`);
-            throw new Error(message);
+        if (!response.ok) {
+            tryParseStreamingError(response, await response.text());
+            throw new Error(`Got response status ${response.status}`);
         }
+        if (stream) {
+            const eventStream = getEventSourceStream();
+            response.body.pipeThrough(eventStream);
+            const reader = eventStream.readable.getReader();
+            return async function* streamData() {
+                let text = '';
+                const swipes = [];
+                const toolCalls = [];
+                const state = { reasoning: '', image: '' };
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) return;
+                    const rawData = value.data;
+                    if (rawData === '[DONE]') return;
+                    tryParseStreamingError(response, rawData);
+                    const parsed = JSON.parse(rawData);
 
-        if (type !== 'quiet') {
-            const logprobs = parseChatCompletionLogprobs(data);
-            // Delay is required to allow the active message to be updated to
-            // the one we are generating (happens right after sendOpenAIRequest)
-            delay(1).then(() => saveLogprobsForActiveMessage(logprobs, null));
+                    if (Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
+                        const swipeIndex = parsed.choices[0].index - 1;
+                        // FIXME: state.reasoning should be an array to support multi-swipe
+                        swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
+                    } else {
+                        text += getStreamingReply(parsed, state);
+                    }
+
+                    ToolManager.parseToolCalls(toolCalls, parsed);
+
+                    yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+                }
+            };
         }
+        else {
+            const data = await response.json();
 
-        return data;
+            checkQuotaError(data);
+            checkModerationError(data);
+
+            if (data.error) {
+                const message = data.error.message || response.statusText || t`Unknown error`;
+                toastr.error(message, t`API returned an error`);
+                throw new Error(message);
+            }
+
+            if (type !== 'quiet') {
+                const logprobs = parseChatCompletionLogprobs(data);
+                // Delay is required to allow the active message to be updated to
+                // the one we are generating (happens right after sendOpenAIRequest)
+                delay(1).then(() => saveLogprobsForActiveMessage(logprobs, null));
+            }
+
+            return data;
+        }
     }
 }
 
@@ -3394,6 +3446,7 @@ function loadOpenAISettings(data, settings) {
     oai_settings.request_images = settings.request_images ?? default_settings.request_images;
     oai_settings.seed = settings.seed ?? default_settings.seed;
     oai_settings.n = settings.n ?? default_settings.n;
+    oai_settings.deepseek_parallel_generations = settings.deepseek_parallel_generations ?? default_settings.deepseek_parallel_generations;
 
     oai_settings.prompts = settings.prompts ?? default_settings.prompts;
     oai_settings.prompt_order = settings.prompt_order ?? default_settings.prompt_order;
@@ -3524,6 +3577,7 @@ function loadOpenAISettings(data, settings) {
     $('#repetition_penalty_counter_openai').val(Number(oai_settings.repetition_penalty_openai));
     $('#seed_openai').val(oai_settings.seed);
     $('#n_openai').val(oai_settings.n);
+    $('#deepseek_parallel_generations').val(oai_settings.deepseek_parallel_generations);
     $('#openai_show_thoughts').prop('checked', oai_settings.show_thoughts);
     $('#openai_enable_web_search').prop('checked', oai_settings.enable_web_search);
     $('#openai_request_images').prop('checked', oai_settings.request_images);
@@ -5207,6 +5261,12 @@ function toggleChatCompletionForms() {
         const validSources = $(this).data('source').split(',');
         $(this).toggle(validSources.includes(oai_settings.chat_completion_source));
     });
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK) {
+        $('#deepseek_parallel_generations_block').show();
+    } else {
+        $('#deepseek_parallel_generations_block').hide();
+    }
 }
 
 async function testApiConnection() {
