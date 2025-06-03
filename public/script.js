@@ -6409,7 +6409,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
 
         chat[newMessageIndex]['swipe_id'] = 0;
         chat[newMessageIndex]['swipes'] = allGeneratedMessages;
-        chat[newMessageIndex]['swipe_info'] = allGeneratedMessages.map((msg, i) => ({
+        chat[newMessageIndex]['swipe_info'] = await Promise.all(allGeneratedMessages.map(async (msg, i) => ({
             send_date: chat[newMessageIndex]['send_date'], // Use main message's send_date
             gen_started: chat[newMessageIndex]['gen_started'], // Use main message's gen_started
             gen_finished: chat[newMessageIndex]['gen_finished'], // Use main message's gen_finished
@@ -6420,7 +6420,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
                 token_count: allGeneratedExtras[i]?.token_count || (power_user.message_token_count_enabled ? await getTokenCountAsync((allGeneratedExtras[i]?.reasoning || reasoning || '') + msg, 0) : 0),
                 reasoning: allGeneratedExtras[i]?.reasoning || reasoning || '', // Specific reasoning or global
             },
-        }));
+        })));
         console.log('[saveReply] DeepSeek swipe_info:', chat[newMessageIndex]['swipe_info']);
 
         !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, newMessageIndex, type);

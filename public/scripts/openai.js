@@ -2356,7 +2356,7 @@ async function sendOpenAIRequest(type, messages, signal) {
                     combinedResult.object = firstValidResult.object || "chat.completion";
                     combinedResult.created = firstValidResult.created || Math.floor(Date.now() / 1000);
                     // Aggregate usage if makes sense, or take from first. For now, use first valid or null.
-                    combinedResult.usage = firstValidResult.usage || null;
+                    combinedResult.usage = firstValidResult.usage || null; 
                 } else {
                     combinedResult.id = `ds-parallel-fallback-${Date.now()}`;
                     combinedResult.model = oai_settings.deepseek_model;
@@ -2378,19 +2378,19 @@ async function sendOpenAIRequest(type, messages, signal) {
                             finish_reason: "error",
                         };
                     }
-
+                    
                     // extractMessageFromData is global, from script.js
                     const messageContent = extractMessageFromData(individualResponse, chat_completion_sources.DEEPSEEK);
                     console.log(`sendOpenAIRequest: Extracted messageContent for response ${index}:`, messageContent);
 
                     return {
                         // Spread the raw individual response so saveReply can access its specific fields if needed (like choices[0].message.reasoning_content)
-                        ...individualResponse,
-                        message: {
+                        ...individualResponse, 
+                        message: { 
                             content: messageContent,
                             role: individualResponse.choices?.[0]?.message?.role || individualResponse.message?.role || 'assistant',
                         },
-                        index: index,
+                        index: index, 
                         // Keep logprobs and finish_reason at this level as well, mimicking OpenAI structure
                         logprobs: individualResponse.choices?.[0]?.logprobs || individualResponse.logprobs || null,
                         finish_reason: individualResponse.choices?.[0]?.finish_reason || individualResponse.finish_reason || 'stop',
@@ -2407,7 +2407,7 @@ async function sendOpenAIRequest(type, messages, signal) {
                     error: true,
                     message: 'Failed to process parallel DeepSeek responses at Promise.all level.',
                     details: error.message,
-                    choices: [],
+                    choices: [], 
                 };
             });
     }
