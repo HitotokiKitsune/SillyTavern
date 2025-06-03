@@ -32,6 +32,7 @@ import {
     substituteParamsExtended,
     system_message_types,
     this_chid,
+    extractMessageFromData,
 } from '../script.js';
 import { getGroupNames, selected_group } from './group-chats.js';
 
