@@ -2339,7 +2339,7 @@ async function sendOpenAIRequest(type, messages, signal) {
                 }).catch(error => {
                     console.error(`DeepSeek parallel fetch network error for promise ${i}:`, error);
                     // Return a structured error for this specific promise
-                    return { error: true, status: 'NetworkError', message: error.message, index: i };
+                    return { error: true, status: 'NetworkError', message: error.message, index: i, api: chat_completion_sources.DEEPSEEK };
                 })
             );
         }
@@ -2356,8 +2356,7 @@ async function sendOpenAIRequest(type, messages, signal) {
                     combinedResult.model = firstValidResult.model || oai_settings.deepseek_model;
                     combinedResult.object = firstValidResult.object || "chat.completion";
                     combinedResult.created = firstValidResult.created || Math.floor(Date.now() / 1000);
-                    // Aggregate usage if makes sense, or take from first. For now, use first valid or null.
-                    combinedResult.usage = firstValidResult.usage || null; 
+                    combinedResult.usage = firstValidResult.usage || null;
                 } else {
                     combinedResult.id = `ds-parallel-fallback-${Date.now()}`;
                     combinedResult.model = oai_settings.deepseek_model;
@@ -2366,35 +2365,71 @@ async function sendOpenAIRequest(type, messages, signal) {
                     combinedResult.usage = null;
                     console.warn('sendOpenAIRequest: No valid result found in DeepSeek parallel responses to use as a template for combinedResult.');
                 }
+                // Add api source for downstream handling
+                combinedResult.api = chat_completion_sources.DEEPSEEK;
 
-                combinedResult.choices = results.map((individualResponse, index) => {
-                    console.log(`sendOpenAIRequest: Processing individual DeepSeek response ${index}:`, JSON.parse(JSON.stringify(individualResponse)));
 
-                    if (!individualResponse || typeof individualResponse !== 'object' || individualResponse.error) {
-                        console.error(`sendOpenAIRequest: Error or invalid object in DeepSeek parallel response ${index}:`, individualResponse);
+                combinedResult.choices = results.map((individualDeepSeekResponse, index) => {
+                    console.log(`sendOpenAIRequest: Processing individual DeepSeek response ${index}:`, JSON.parse(JSON.stringify(individualDeepSeekResponse)));
+
+                    if (!individualDeepSeekResponse || typeof individualDeepSeekResponse !== 'object' || individualDeepSeekResponse.error) {
+                        console.error(`sendOpenAIRequest: Error or invalid object in DeepSeek parallel response ${index}:`, individualDeepSeekResponse);
                         return {
-                            message: { content: `[Error in parallel generation ${index + 1}: ${individualResponse?.message || 'Unknown error'}]`, role: 'assistant' },
+                            message: { content: `[Error in parallel generation ${index + 1}: ${individualDeepSeekResponse?.message || 'Unknown error'}]`, role: 'assistant' },
                             index: index,
                             logprobs: null,
                             finish_reason: "error",
+                            api: chat_completion_sources.DEEPSEEK, // Mark API source
+                            model: oai_settings.deepseek_model, // Mark model
                         };
                     }
-                    
-                    // extractMessageFromData is global, from script.js
-                    const messageContent = extractMessageFromData(individualResponse, chat_completion_sources.DEEPSEEK);
-                    console.log(`sendOpenAIRequest: Extracted messageContent for response ${index}:`, messageContent);
+
+                    let messageContent;
+                    // Explicitly try to get content from DeepSeek's known structure first
+                    if (individualDeepSeekResponse.choices && individualDeepSeekResponse.choices[0] && individualDeepSeekResponse.choices[0].message && typeof individualDeepSeekResponse.choices[0].message.content === 'string') {
+                        messageContent = individualDeepSeekResponse.choices[0].message.content;
+                        console.log(`sendOpenAIRequest: (Direct Access) Extracted messageContent for response ${index}: "${messageContent}"`);
+                    } else {
+                        // Fallback to extractMessageFromData if direct access fails
+                        console.warn(`sendOpenAIRequest: message.content not found in expected DeepSeek path for response index ${index}. Object:`, JSON.parse(JSON.stringify(individualDeepSeekResponse)));
+                        messageContent = extractMessageFromData(individualDeepSeekResponse, chat_completion_sources.DEEPSEEK);
+                        console.log(`sendOpenAIRequest: (Fallback extractMessageFromData) Extracted messageContent for response ${index}: "${messageContent}"`);
+                        if (!messageContent && messageContent !== "") { // Ensure it's a string, even if empty
+                             console.error('sendOpenAIRequest: Fallback extractMessageFromData also failed to get content for response index ' + index + '. Setting to empty string.');
+                             messageContent = '';
+                        }
+                    }
+
+                    // Explicitly extract reasoning_content if available
+                    let reasoningContent = null; // Default to null if not found
+                    if (individualDeepSeekResponse.choices && individualDeepSeekResponse.choices[0] && individualDeepSeekResponse.choices[0].message && typeof individualDeepSeekResponse.choices[0].message.reasoning_content === 'string') {
+                        reasoningContent = individualDeepSeekResponse.choices[0].message.reasoning_content;
+                        console.log(`sendOpenAIRequest: Extracted reasoningContent for response ${index}: "${reasoningContent}"`);
+                    } else {
+                        console.log(`sendOpenAIRequest: No reasoning_content found for response ${index}.`);
+                    }
+
+                    // Extract usage if present on the individual response (DeepSeek might provide it per "choice" effectively)
+                    const usage = individualDeepSeekResponse.usage || individualDeepSeekResponse.choices?.[0]?.usage || null;
 
                     return {
-                        // Spread the raw individual response so saveReply can access its specific fields if needed (like choices[0].message.reasoning_content)
-                        ...individualResponse, 
-                        message: { 
-                            content: messageContent,
-                            role: individualResponse.choices?.[0]?.message?.role || individualResponse.message?.role || 'assistant',
+                        message: {
+                            content: messageContent, // Use explicitly extracted content
+                            role: individualDeepSeekResponse.choices?.[0]?.message?.role || 'assistant',
+                            reasoning_content: reasoningContent, // Add explicitly extracted reasoning
                         },
-                        index: index, 
-                        // Keep logprobs and finish_reason at this level as well, mimicking OpenAI structure
-                        logprobs: individualResponse.choices?.[0]?.logprobs || individualResponse.logprobs || null,
-                        finish_reason: individualResponse.choices?.[0]?.finish_reason || individualResponse.finish_reason || 'stop',
+                        index: index,
+                        logprobs: individualDeepSeekResponse.choices?.[0]?.logprobs || null,
+                        finish_reason: individualDeepSeekResponse.choices?.[0]?.finish_reason || 'stop',
+                        // Carry over the full individual response's metadata if needed by later stages,
+                        // but prioritize structured fields above.
+                        // Add api and model for downstream handler
+                        api: chat_completion_sources.DEEPSEEK,
+                        model: individualDeepSeekResponse.model || oai_settings.deepseek_model,
+                        usage: usage, // Add usage from individual response
+                        // It's useful to pass the whole original choice from the individual response if it exists
+                        // as it might contain other specific fields like `citations` for some models.
+                        raw_choice: individualDeepSeekResponse.choices?.[0] || null,
                     };
                 });
 
@@ -2408,7 +2443,7 @@ async function sendOpenAIRequest(type, messages, signal) {
                     error: true,
                     message: 'Failed to process parallel DeepSeek responses at Promise.all level.',
                     details: error.message,
-                    choices: [], 
+                    choices: [],
                 };
             });
     }
