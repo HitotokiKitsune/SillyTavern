@@ -6307,19 +6307,28 @@ async function processImageAttachment(message, { parsedImage, imageUrl }) {
  */
 export async function saveReply({ type, getMessage, fromStreaming = false, title = '', swipes = [], reasoning = '', imageUrl = '', data = {} }) {
     // Backward compatibility
+    // Backward compatibility
     if (arguments.length > 1 && typeof arguments[0] !== 'object') {
         console.trace('saveReply called with positional arguments. Please use an object instead.');
         [type, getMessage, fromStreaming, title, swipes, reasoning, imageUrl] = arguments;
     }
-    console.log('[saveReply] Entry:', { type, getMessage, fromStreaming, title, swipes, reasoning, imageUrl, data });
+    // console.log('[saveReply] Entry:', { type, getMessage, fromStreaming, title, swipes, reasoning, imageUrl, data }); // Original log
+    console.log('[saveReply] received data:', JSON.parse(JSON.stringify(data))); // More detailed log for data object
 
-    // Condition for DeepSeek parallel generation (client-side)
-    const isDeepSeekClientParallel = data?.choices && data.choices.length > 1 && data.api === chat_completion_sources.DEEPSEEK && oai_settings.deepseek_parallel_generations > 1;
-    // Condition for OpenAI 'n' parameter (server-side multi-choice) or other similar multi-choice responses
-    const isOpenAIMultiChoice = main_api === 'openai' && Array.isArray(data?.choices) && data.choices.length > 1 && !isDeepSeekClientParallel;
-
+    // Declare isDeepSeekClientParallel and isOpenAIMultiChoice
+    const isDeepSeekClientParallel = Array.isArray(data?.choices) && data.choices.length > 1 &&
+                                   data.api === chat_completion_sources.DEEPSEEK && // Check data.api (set by openai.js)
+                                   oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
+                                   oai_settings.deepseek_parallel_generations > 1;
     console.log('[saveReply] isDeepSeekClientParallel:', isDeepSeekClientParallel);
+
+    // Refined condition for OpenAI server-side 'n' > 1
+    const isOpenAIMultiChoice = main_api === 'openai' &&
+                              oai_settings.chat_completion_source !== chat_completion_sources.DEEPSEEK && // Explicitly not DeepSeek client parallel
+                              Array.isArray(data?.choices) && data.choices.length > 1 &&
+                              oai_settings.n > 1; // Check if the general 'n' setting is actually > 1
     console.log('[saveReply] isOpenAIMultiChoice:', isOpenAIMultiChoice);
+
 
     if (type != 'append' && type != 'continue' && type != 'appendFinal' && chat.length && (chat[chat.length - 1]['swipe_id'] === undefined ||
         chat[chat.length - 1]['is_user'])) {
