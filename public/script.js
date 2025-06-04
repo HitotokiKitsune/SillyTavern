@@ -4963,7 +4963,19 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         console.debug(`pushed prompt bits to itemizedPrompts array. Length is now: ${itemizedPrompts.length}`);
 
-        if (isStreamingEnabled() && type !== 'quiet') {
+        const isDeepSeekClientParallel = main_api === 'openai' &&
+                                   oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
+                                   oai_settings.deepseek_parallel_generations > 1 &&
+                                   type !== 'quiet';
+
+        if (isDeepSeekClientParallel) {
+            // Directly await the result which will be a promise containing all choices.
+            // This path effectively becomes non-streaming for DeepSeek parallel.
+            // sendGenerationRequest will call sendOpenAIRequest, which for this specific
+            // DeepSeek setup, returns a Promise that resolves with the full combinedResult.
+            return sendGenerationRequest(type, generate_data).then(onSuccess, onError);
+        }
+        else if (isStreamingEnabled() && type !== 'quiet') {
             continue_mag = promptReasoning.removePrefix(continue_mag);
             streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
             if (isContinue) {
