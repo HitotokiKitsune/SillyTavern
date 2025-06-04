@@ -3593,6 +3593,23 @@ class StreamingProcessor {
             scrollLock = false;
         }
 
+        // Check for invalid reader (OpenAI / DeepSeek specific part)
+        if (main_api === 'openai' && (oai_settings.chat_completion_source === chat_completion_sources.OPENAI || oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK)) {
+            // The generator function itself is what's awaited.
+            // The reader is part of the generator's internal state, which is not directly accessible here before the first .next() call.
+            // However, sendOpenAIRequest now returns null if reader initialization fails for DeepSeek.
+            // We need to ensure that `this.generator()` which is `sendOpenAIRequest` result is checked.
+            // This check is more conceptual for this specific location, the actual direct `reader` check
+            // would be inside `sendOpenAIRequest` or if `this.generator` itself is the reader.
+            // For now, if `this.generator` is null (because sendOpenAIRequest returned null), we can catch it.
+            if (!this.generator) {
+                console.error('StreamingProcessor.generate: Invalid or null generator received, possibly due to reader initialization failure in sendOpenAIRequest.');
+                this.onErrorStreaming(); // Ensure cleanup
+                throw new Error("Stream reader/generator initialization failed.");
+            }
+        }
+
+
         // Stopping strings are expensive to calculate, especially with macros enabled. To remove stopping strings
         // when streaming, we cache the result of getStoppingStrings instead of calling it once per token.
         const isImpersonate = this.type == 'impersonate';
@@ -4963,19 +4980,32 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         console.debug(`pushed prompt bits to itemizedPrompts array. Length is now: ${itemizedPrompts.length}`);
 
-        const isDeepSeekClientParallel = main_api === 'openai' &&
-                                   oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
-                                   oai_settings.deepseek_parallel_generations > 1 &&
-                                   type !== 'quiet';
+        const isOpenAsDeepSeek = () => main_api === 'openai' && oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK;
+        const isDeepSeekClientParallel = isOpenAsDeepSeek() && oai_settings.deepseek_parallel_generations > 1 && type !== 'quiet';
+        const streamingEnabled = isStreamingEnabled();
+
+        console.log('DeepSeek Debug: oai_settings.api_key (first 15)', oai_settings.api_key ? oai_settings.api_key.substring(0, 15) : 'N/A');
+        console.log('DeepSeek Debug: oai_settings.deepseek_parallel_generations', oai_settings.deepseek_parallel_generations);
+        // For the Arabic key, assuming it's a placeholder for a real config value.
+        // If kai_settings is the correct object, it would be:
+        // console.log('DeepSeek Debug: kai_settings.koboldai_user_path (example - replace with actual key)', kai_settings.koboldai_user_path);
+        // Since "كوبولدAPIإعدادات.مسارالمستخدم" is not a valid JS identifier, I'll log a placeholder.
+        // If you provide the actual JS variable path, I can log that instead.
+        console.log('DeepSeek Debug: كوبولدAPIإعدادات.مسارالمستخدم (Placeholder - oai_settings.koboldai_user_path might be relevant if it exists)', oai_settings.koboldai_user_path); // Placeholder
+        console.log('DeepSeek Debug: isOpenAsDeepSeek()', isOpenAsDeepSeek());
+        console.log('DeepSeek Debug: isDeepSeekClientParallel', isDeepSeekClientParallel);
+        console.log('DeepSeek Debug: isStreamingEnabled()', streamingEnabled);
 
         if (isDeepSeekClientParallel) {
+            console.log("Path A: DeepSeek Client Parallel");
             // Directly await the result which will be a promise containing all choices.
             // This path effectively becomes non-streaming for DeepSeek parallel.
             // sendGenerationRequest will call sendOpenAIRequest, which for this specific
             // DeepSeek setup, returns a Promise that resolves with the full combinedResult.
             return sendGenerationRequest(type, generate_data).then(onSuccess, onError);
         }
-        else if (isStreamingEnabled() && type !== 'quiet') {
+        else if (streamingEnabled && type !== 'quiet') {
+            console.log("Path B: Streaming");
             continue_mag = promptReasoning.removePrefix(continue_mag);
             streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
             if (isContinue) {
@@ -5035,6 +5065,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 });
             }
         } else {
+            console.log("Path C: Non-streaming");
             return await sendGenerationRequest(type, generate_data);
         }
     }

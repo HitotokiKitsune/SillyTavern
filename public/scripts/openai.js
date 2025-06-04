@@ -2310,7 +2310,7 @@ async function sendOpenAIRequest(type, messages, signal) {
 
     // START DEEPSEEK PARALLEL GENERATION
     if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && oai_settings.deepseek_parallel_generations > 1 && !isQuiet) {
-        console.log('sendOpenAIRequest: DeepSeek parallel generation triggered. Count:', oai_settings.deepseek_parallel_generations);
+        // console.log('sendOpenAIRequest: DeepSeek parallel generation triggered. Count:', oai_settings.deepseek_parallel_generations); // Already logged in finishGenerating
         const numGenerations = oai_settings.deepseek_parallel_generations;
         const promises = [];
         const singleGenerateData = { ...generate_data };
@@ -2431,6 +2431,30 @@ async function sendOpenAIRequest(type, messages, signal) {
             const eventStream = getEventSourceStream();
             response.body.pipeThrough(eventStream);
             const reader = eventStream.readable.getReader();
+
+            // START DeepSeek stream error handling
+            if (params.stream && isDeepSeek) {
+                try {
+                    const { done, value: data_1 } = await reader.read();
+                    if (done) return null; // Should not happen on first read normally
+
+                    const initialChunk = JSON.parse(data_1.data);
+
+                    if (!initialChunk || !initialChunk.choices || !initialChunk.choices[0] || !initialChunk.choices[0].message || typeof initialChunk.choices[0].message.content !== 'string') {
+                        console.error('DeepSeek Streaming Error: Initial chunk missing expected structure.', initialChunk);
+                        return null;
+                    }
+                } catch (err) {
+                    console.error('DeepSeek Streaming Error: Failed to parse initial chunk or unexpected error.', err);
+                    // Attempt to release the lock if the reader has one.
+                    try { if (reader && typeof reader.releaseLock === 'function') reader.releaseLock(); } catch (lockErr) { console.error("Error releasing reader lock:", lockErr); }
+                    // Ensure the response body is fully consumed or closed to prevent resource leaks, if applicable.
+                    try { if (response && response.body && typeof response.body.cancel === 'function') await response.body.cancel(); } catch (cancelErr) { console.error("Error cancelling response body:", cancelErr); }
+                    return null;
+                }
+            }
+            // END DeepSeek stream error handling
+
             return async function* streamData() {
                 let text = '';
                 const swipes = [];
@@ -2459,7 +2483,18 @@ async function sendOpenAIRequest(type, messages, signal) {
             };
         }
         else {
-            const data = await response.json();
+            // Non-streaming DeepSeek or other providers
+            let data;
+            try {
+                data = await response.json();
+            } catch (jsonError) {
+                console.error('sendOpenAIRequest: Failed to parse JSON response for non-streaming request.', jsonError, response.status, response.statusText);
+                // Attempt to get text if JSON parsing fails, for more detailed error logging
+                let errorText = await response.text().catch(() => 'Could not retrieve error text.');
+                toastr.error(t`Failed to parse server response. Status: ${response.status}. Error: ${errorText.substring(0,100)}`, t`API Error`);
+                return null; // Ensure null is returned on JSON parsing failure
+            }
+
 
             checkQuotaError(data);
             checkModerationError(data);
@@ -2467,7 +2502,8 @@ async function sendOpenAIRequest(type, messages, signal) {
             if (data.error) {
                 const message = data.error.message || response.statusText || t`Unknown error`;
                 toastr.error(message, t`API returned an error`);
-                throw new Error(message);
+                // throw new Error(message); // Let's return null instead of throwing to allow graceful handling
+                return null;
             }
 
             if (type !== 'quiet') {
