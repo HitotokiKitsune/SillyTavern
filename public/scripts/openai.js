@@ -32,6 +32,7 @@ import {
     substituteParamsExtended,
     system_message_types,
     this_chid,
+    extractMessageFromData,
 } from '../script.js';
 import { getGroupNames, selected_group } from './group-chats.js';
 
@@ -320,6 +321,7 @@ export const settingsToUpdate = {
     n: ['#n_openai', 'n', false, false],
     bypass_status_check: ['#openai_bypass_status_check', 'bypass_status_check', true, true],
     request_images: ['#openai_request_images', 'request_images', true, false],
+    deepseek_parallel_generations: ['#deepseek_parallel_generations', 'deepseek_parallel_generations', false, false],
 };
 
 const default_settings = {
@@ -403,6 +405,7 @@ const default_settings = {
     request_images: false,
     seed: -1,
     n: 1,
+    // deepseek_parallel_generations: 1, // This line is already present in default_settings
     bind_preset_to_connection: true,
 };
 
@@ -487,6 +490,7 @@ const oai_settings = {
     request_images: false,
     seed: -1,
     n: 1,
+    // deepseek_parallel_generations: 1, // This line is already present in oai_settings
     bind_preset_to_connection: true,
 };
 
@@ -2068,7 +2072,7 @@ async function sendOpenAIRequest(type, messages, signal) {
     const isXAI = oai_settings.chat_completion_source == chat_completion_sources.XAI;
     const isPollinations = oai_settings.chat_completion_source == chat_completion_sources.POLLINATIONS;
     const isTextCompletion = isOAI && textCompletionModels.includes(oai_settings.openai_model);
-    const isQuiet = type === 'quiet';
+    const isQuiet = type === 'quiet'; // Used for DeepSeek parallel condition
     const isImpersonate = type === 'impersonate';
     const isContinue = type === 'continue';
     const stream = oai_settings.stream_openai && !isQuiet && !isScale && !(isOAI && ['o1-2024-12-17', 'o1'].includes(oai_settings.openai_model));
@@ -2303,68 +2307,178 @@ async function sendOpenAIRequest(type, messages, signal) {
     await eventSource.emit(event_types.CHAT_COMPLETION_SETTINGS_READY, generate_data);
 
     const generate_url = '/api/backends/chat-completions/generate';
-    const response = await fetch(generate_url, {
-        method: 'POST',
-        body: JSON.stringify(generate_data),
-        headers: getRequestHeaders(),
-        signal: signal,
-    });
 
-    if (!response.ok) {
-        tryParseStreamingError(response, await response.text());
-        throw new Error(`Got response status ${response.status}`);
-    }
-    if (stream) {
-        const eventStream = getEventSourceStream();
-        response.body.pipeThrough(eventStream);
-        const reader = eventStream.readable.getReader();
-        return async function* streamData() {
-            let text = '';
-            const swipes = [];
-            const toolCalls = [];
-            const state = { reasoning: '', image: '' };
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                const rawData = value.data;
-                if (rawData === '[DONE]') return;
-                tryParseStreamingError(response, rawData);
-                const parsed = JSON.parse(rawData);
+    // START DEEPSEEK PARALLEL GENERATION
+    if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK && oai_settings.deepseek_parallel_generations > 1 && !isQuiet) {
+        console.log('sendOpenAIRequest: DeepSeek parallel generation triggered. Count:', oai_settings.deepseek_parallel_generations);
+        const numGenerations = oai_settings.deepseek_parallel_generations;
+        const promises = [];
+        const singleGenerateData = { ...generate_data };
+        delete singleGenerateData.n; // Remove 'n' as we're handling parallelism client-side
+        delete singleGenerateData.stream; // Ensure streaming is off for parallel calls
 
-                if (Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
-                    const swipeIndex = parsed.choices[0].index - 1;
-                    // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
-                } else {
-                    text += getStreamingReply(parsed, state);
+        // console.log('sendOpenAIRequest: singleGenerateData for parallel calls:', JSON.parse(JSON.stringify(singleGenerateData))); // Optional: for debugging
+
+        for (let i = 0; i < numGenerations; i++) {
+            promises.push(
+                fetch(generate_url, {
+                    method: 'POST',
+                    body: JSON.stringify(singleGenerateData),
+                    headers: getRequestHeaders(),
+                    signal: signal, // Main signal for all
+                }).then(response => {
+                    if (!response.ok) {
+                        return response.text().then(text => {
+                            // console.error(`DeepSeek parallel fetch error (status ${response.status}):`, text); // Optional: for debugging
+                            tryParseStreamingError(response, text);
+                            return { error: true, status: response.status, message: text, index: i, api: chat_completion_sources.DEEPSEEK, model: singleGenerateData.model };
+                        });
+                    }
+                    return response.json();
+                }).catch(error => {
+                    // console.error(`DeepSeek parallel fetch network error for promise ${i}:`, error); // Optional: for debugging
+                    return { error: true, status: 'NetworkError', message: error.message, index: i, api: chat_completion_sources.DEEPSEEK, model: singleGenerateData.model };
+                })
+            );
+        }
+
+        return Promise.all(promises).then(results => {
+            // console.log('sendOpenAIRequest: DeepSeek parallel raw results:', JSON.parse(JSON.stringify(results))); // Optional: for debugging
+            const combinedResult = {};
+            const firstValidResult = results.find(r => r && typeof r === 'object' && !r.error);
+
+            if (firstValidResult) {
+                combinedResult.id = firstValidResult.id || `ds-parallel-${Date.now()}`;
+                combinedResult.model = firstValidResult.model || oai_settings.deepseek_model; // Base model
+                combinedResult.object = firstValidResult.object || "chat.completion";
+                combinedResult.created = firstValidResult.created || Math.floor(Date.now() / 1000);
+                // Aggregate usage if possible, or take from the first valid one.
+                // For simplicity, we'll take the first valid one or null. A more complex aggregation might be needed.
+                combinedResult.usage = firstValidResult.usage || null;
+            } else {
+                // Fallback if all requests failed
+                combinedResult.id = `ds-parallel-error-${Date.now()}`;
+                combinedResult.model = oai_settings.deepseek_model;
+                combinedResult.object = "chat.completion";
+                combinedResult.created = Math.floor(Date.now() / 1000);
+                combinedResult.usage = null;
+            }
+            combinedResult.api = chat_completion_sources.DEEPSEEK; // Essential for downstream handling
+
+            combinedResult.choices = results.map((res, index) => {
+                if (res.error) {
+                    return {
+                        message: { content: `[Error in generation ${index + 1}: ${res.message}]`, role: 'assistant', reasoning_content: null },
+                        index: index,
+                        logprobs: null,
+                        finish_reason: "error",
+                        api: res.api || chat_completion_sources.DEEPSEEK,
+                        model: res.model || oai_settings.deepseek_model,
+                        usage: null,
+                        raw_choice: { error_details: res }, // Store error details
+                    };
                 }
 
-                ToolManager.parseToolCalls(toolCalls, parsed);
+                // Attempt to robustly extract content and reasoning
+                let messageContent = '';
+                let reasoningContent = null;
+                let role = 'assistant';
 
-                yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+                if (res.choices && res.choices[0] && res.choices[0].message) {
+                    messageContent = res.choices[0].message.content || '';
+                    reasoningContent = res.choices[0].message.reasoning_content || null;
+                    role = res.choices[0].message.role || 'assistant';
+                } else if (res.message && typeof res.message.content === 'string') { // Simpler structure if DeepSeek returns this way
+                    messageContent = res.message.content;
+                    reasoningContent = res.message.reasoning_content || null;
+                    role = res.message.role || 'assistant';
+                }
+                else { // Fallback if structure is unexpected
+                    messageContent = extractMessageFromData(res, chat_completion_sources.DEEPSEEK);
+                }
+
+                return {
+                    message: {
+                        content: messageContent,
+                        role: role,
+                        reasoning_content: reasoningContent,
+                    },
+                    index: index,
+                    logprobs: res.choices?.[0]?.logprobs || res.logprobs || null,
+                    finish_reason: res.choices?.[0]?.finish_reason || res.finish_reason || 'stop',
+                    api: chat_completion_sources.DEEPSEEK, // API per choice
+                    model: res.model || oai_settings.deepseek_model, // Model per choice
+                    usage: res.usage || null, // Usage per choice
+                    raw_choice: res.choices?.[0] || res, // Store original choice part or full res
+                };
+            });
+            // console.log('sendOpenAIRequest: Final combinedResult for DeepSeek parallel:', JSON.parse(JSON.stringify(combinedResult))); // Optional: for debugging
+            return combinedResult;
+        });
+    } else { // Original fetch call or other providers
+        const response = await fetch(generate_url, {
+            method: 'POST',
+            body: JSON.stringify(generate_data),
+            headers: getRequestHeaders(),
+            signal: signal,
+        });
+
+        if (!response.ok) {
+            tryParseStreamingError(response, await response.text());
+            throw new Error(`Got response status ${response.status}`);
+        }
+        if (stream) {
+            const eventStream = getEventSourceStream();
+            response.body.pipeThrough(eventStream);
+            const reader = eventStream.readable.getReader();
+            return async function* streamData() {
+                let text = '';
+                const swipes = [];
+                const toolCalls = [];
+                const state = { reasoning: '', image: '' };
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) return;
+                    const rawData = value.data;
+                    if (rawData === '[DONE]') return;
+                    tryParseStreamingError(response, rawData);
+                    const parsed = JSON.parse(rawData);
+
+                    if (Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
+                        const swipeIndex = parsed.choices[0].index - 1;
+                        // FIXME: state.reasoning should be an array to support multi-swipe
+                        swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
+                    } else {
+                        text += getStreamingReply(parsed, state);
+                    }
+
+                    ToolManager.parseToolCalls(toolCalls, parsed);
+
+                    yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+                }
+            };
+        }
+        else {
+            const data = await response.json();
+
+            checkQuotaError(data);
+            checkModerationError(data);
+
+            if (data.error) {
+                const message = data.error.message || response.statusText || t`Unknown error`;
+                toastr.error(message, t`API returned an error`);
+                throw new Error(message);
             }
-        };
-    }
-    else {
-        const data = await response.json();
 
-        checkQuotaError(data);
-        checkModerationError(data);
+            if (type !== 'quiet') {
+                const logprobs = parseChatCompletionLogprobs(data);
+                // Delay is required to allow the active message to be updated to
+                // the one we are generating (happens right after sendOpenAIRequest)
+                delay(1).then(() => saveLogprobsForActiveMessage(logprobs, null));
+            }
 
-        if (data.error) {
-            const message = data.error.message || response.statusText || t`Unknown error`;
-            toastr.error(message, t`API returned an error`);
-            throw new Error(message);
+            return data;
         }
-
-        if (type !== 'quiet') {
-            const logprobs = parseChatCompletionLogprobs(data);
-            // Delay is required to allow the active message to be updated to
-            // the one we are generating (happens right after sendOpenAIRequest)
-            delay(1).then(() => saveLogprobsForActiveMessage(logprobs, null));
-        }
-
-        return data;
     }
 }
 
@@ -3394,6 +3508,9 @@ function loadOpenAISettings(data, settings) {
     oai_settings.request_images = settings.request_images ?? default_settings.request_images;
     oai_settings.seed = settings.seed ?? default_settings.seed;
     oai_settings.n = settings.n ?? default_settings.n;
+    oai_settings.deepseek_parallel_generations = settings.deepseek_parallel_generations ?? default_settings.deepseek_parallel_generations;
+    $('#deepseek_parallel_generations').val(oai_settings.deepseek_parallel_generations);
+    $('#deepseek_parallel_generations_slider').val(oai_settings.deepseek_parallel_generations);
 
     oai_settings.prompts = settings.prompts ?? default_settings.prompts;
     oai_settings.prompt_order = settings.prompt_order ?? default_settings.prompt_order;
@@ -3524,6 +3641,7 @@ function loadOpenAISettings(data, settings) {
     $('#repetition_penalty_counter_openai').val(Number(oai_settings.repetition_penalty_openai));
     $('#seed_openai').val(oai_settings.seed);
     $('#n_openai').val(oai_settings.n);
+    $('#deepseek_parallel_generations').val(oai_settings.deepseek_parallel_generations);
     $('#openai_show_thoughts').prop('checked', oai_settings.show_thoughts);
     $('#openai_enable_web_search').prop('checked', oai_settings.enable_web_search);
     $('#openai_request_images').prop('checked', oai_settings.request_images);
@@ -5207,6 +5325,12 @@ function toggleChatCompletionForms() {
         const validSources = $(this).data('source').split(',');
         $(this).toggle(validSources.includes(oai_settings.chat_completion_source));
     });
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK) {
+        $('#deepseek_parallel_generations_block').show();
+    } else {
+        $('#deepseek_parallel_generations_block').hide();
+    }
 }
 
 async function testApiConnection() {

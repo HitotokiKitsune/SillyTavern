@@ -652,6 +652,20 @@
                                         <input type="number" id="openai_max_tokens" name="openai_max_tokens" class="text_pole" min="1" max="65536">
                                     </div>
                                 </div>
+                                <div id="deepseek_parallel_generations_block" class="range-block" data-source="deepseek" style="display: none;">
+                                    <div class="range-block-title" data-i18n="Parallel Generations (DeepSeek)">
+                                        Parallel Generations (DeepSeek)
+                                        <div class="fa-solid fa-circle-info opacity50p" title="Number of identical prompts to send concurrently to DeepSeek (1-5). API 'n' parameter is not used." data-i18n="[title]Number of identical prompts to send concurrently to DeepSeek (1-5). API 'n' parameter is not used."></div>
+                                    </div>
+                                    <div class="range-block-range-and-counter">
+                                        <div class="range-block-range">
+                                            <input type="range" id="deepseek_parallel_generations_slider" class="neo-range-slider" name="deepseek_parallel_generations_slider" min="1" max="5" step="1" value="1">
+                                        </div>
+                                        <div class="range-block-counter">
+                                            <input type="number" id="deepseek_parallel_generations" class="neo-range-input" name="deepseek_parallel_generations" min="1" max="5" step="1" value="1" data-for="deepseek_parallel_generations_slider">
+                                        </div>
+                                    </div>
+                                </div>
                                 <div class="range-block" data-source="openai,custom,xai">
                                     <div class="range-block-title" data-i18n="Multiple swipes per generation">
                                         Multiple swipes per generation

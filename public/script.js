@@ -5035,7 +5035,10 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @returns {Promise<String|{fromStream}|*|string|string|void|Awaited<*>|undefined>}
      * @throws {Error} Throws an error if the response data contains an error message
      */
-    async function onSuccess(data) {
+    async function onSuccess(data) { // data here is apiResponseData
+        console.log('[Generate] Received apiResponseData (raw):', JSON.parse(JSON.stringify(data))); // Log before cloning
+        const apiResponseDataForSaveReply = JSON.parse(JSON.stringify(data)); // Create deep clone FOR saveReply's data field
+
         if (!data) return;
 
         if (data?.fromStream) {
@@ -5056,58 +5059,59 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         //const getData = await response.json();
-        let getMessage = extractMessageFromData(data);
-        let title = extractTitleFromData(data);
-        let reasoning = extractReasoningFromData(data);
-        let imageUrl = extractImageFromData(data);
-        kobold_horde_model = title;
+        let extractedMessage = extractMessageFromData(data); // Use original 'data' for extractions
+        let extractedTitle = extractTitleFromData(data); // Use original 'data'
+        let currentReasoning = extractReasoningFromData(data); // Use original 'data'
+        let currentImageUrl = extractImageFromData(data); // Use original 'data'
+        kobold_horde_model = extractedTitle;
 
-        const swipes = extractMultiSwipes(data, type);
+        const extractedSwipes = extractMultiSwipes(data, type); // Use original 'data'
 
         messageChunk = cleanUpMessage({
-            getMessage: getMessage,
+            getMessage: extractedMessage,
             isImpersonate: isImpersonate,
             isContinue: isContinue,
             displayIncompleteSentences: false,
         });
 
 
-        reasoning = getRegexedString(reasoning, regex_placement.REASONING);
+        currentReasoning = getRegexedString(currentReasoning, regex_placement.REASONING);
 
         if (power_user.trim_spaces) {
-            reasoning = reasoning.trim();
+            currentReasoning = currentReasoning.trim();
         }
 
         if (isContinue) {
             continue_mag = promptReasoning.removePrefix(continue_mag);
-            getMessage = continue_mag + getMessage;
+            extractedMessage = continue_mag + extractedMessage;
         }
 
         //Formating
         const displayIncomplete = type === 'quiet' && !quietToLoud;
-        getMessage = cleanUpMessage({
-            getMessage: getMessage,
+        extractedMessage = cleanUpMessage({
+            getMessage: extractedMessage,
             isImpersonate: isImpersonate,
             isContinue: isContinue,
             displayIncompleteSentences: displayIncomplete,
         });
 
         if (isImpersonate) {
-            $('#send_textarea').val(getMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
+            $('#send_textarea').val(extractedMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
             generatedPromptCache = '';
-            await eventSource.emit(event_types.IMPERSONATE_READY, getMessage);
+            await eventSource.emit(event_types.IMPERSONATE_READY, extractedMessage);
         }
         else if (type == 'quiet') {
             unblockGeneration(type);
-            return getMessage;
+            return extractedMessage;
         }
         else {
             // Without streaming we'll be having a full message on continuation. Treat it as a last chunk.
+            console.log('[Generate] Calling saveReply with apiResponseDataForSaveReply:', JSON.parse(JSON.stringify(apiResponseDataForSaveReply)));
             if (originalType !== 'continue') {
-                ({ type, getMessage } = await saveReply({ type, getMessage, title, swipes, reasoning, imageUrl }));
+                ({ type, getMessage: extractedMessage } = await saveReply({ type, getMessage: extractedMessage, title: extractedTitle, swipes: extractedSwipes, reasoning: currentReasoning, imageUrl: currentImageUrl, data: apiResponseDataForSaveReply }));
             }
             else {
-                ({ type, getMessage } = await saveReply({ type: 'appendFinal', getMessage, title, swipes, reasoning, imageUrl }));
+                ({ type, getMessage: extractedMessage } = await saveReply({ type: 'appendFinal', getMessage: extractedMessage, title: extractedTitle, swipes: extractedSwipes, reasoning: currentReasoning, imageUrl: currentImageUrl, data: apiResponseDataForSaveReply }));
             }
 
             // This relies on `saveReply` having been called to add the message to the chat, so it must be last.
@@ -5116,7 +5120,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         if (canPerformToolCalls) {
             const hasToolCalls = ToolManager.hasToolCalls(data);
-            const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(getMessage);
+            const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(extractedMessage);
             hasToolCalls && shouldDeleteMessage && await deleteLastMessage();
             const invocationResult = await ToolManager.invokeFunctionTools(data);
             const shouldStopGeneration = (!invocationResult.invocations.length && shouldDeleteMessage) || invocationResult.stealthCalls.length;
@@ -5141,7 +5145,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         const isAborted = abortController && abortController.signal.aborted;
-        if (!isAborted && power_user.auto_swipe && generatedTextFiltered(getMessage)) {
+        if (!isAborted && power_user.auto_swipe && generatedTextFiltered(extractedMessage)) {
             is_send_press = false;
             return swipe_right();
         }
@@ -5156,7 +5160,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         // Don't break the API chain that expects a single string in return
-        return Object.defineProperty(new String(getMessage), 'messageChunk', { value: messageChunk });
+        return Object.defineProperty(new String(extractedMessage), 'messageChunk', { value: messageChunk });
     }
 
     /**
@@ -6305,12 +6309,34 @@ async function processImageAttachment(message, { parsedImage, imageUrl }) {
  * @property {string} type Type of generation
  * @property {string} getMessage Generated message
  */
-export async function saveReply({ type, getMessage, fromStreaming = false, title = '', swipes = [], reasoning = '', imageUrl = '' }) {
+export async function saveReply({ type, getMessage, fromStreaming = false, title = '', swipes = [], reasoning = '', imageUrl = '', data = {} }) {
+    // Backward compatibility
     // Backward compatibility
     if (arguments.length > 1 && typeof arguments[0] !== 'object') {
         console.trace('saveReply called with positional arguments. Please use an object instead.');
         [type, getMessage, fromStreaming, title, swipes, reasoning, imageUrl] = arguments;
     }
+    // console.log('[saveReply] Entry:', { type, getMessage, fromStreaming, title, swipes, reasoning, imageUrl, data }); // Original log
+    console.log('[saveReply] received data:', JSON.parse(JSON.stringify(data))); // More detailed log for data object
+
+    // Declare isDeepSeekClientParallel and isOpenAIMultiChoice
+    const isDeepSeekClientParallel = Array.isArray(data?.choices) && data.choices.length > 1 &&
+                                   data.api === chat_completion_sources.DEEPSEEK && // Check data.api (set by openai.js)
+                                   oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
+                                   oai_settings.deepseek_parallel_generations > 1;
+    // console.log('[saveReply] isDeepSeekClientParallel:', isDeepSeekClientParallel); // Original log for declaration
+
+    // Refined condition for OpenAI server-side 'n' > 1
+    const isOpenAIMultiChoice = main_api === 'openai' &&
+                              oai_settings.chat_completion_source !== chat_completion_sources.DEEPSEEK && // Explicitly not DeepSeek client parallel
+                              Array.isArray(data?.choices) && data.choices.length > 1 &&
+                              oai_settings.n > 1; // Check if the general 'n' setting is actually > 1
+    // console.log('[saveReply] isOpenAIMultiChoice:', isOpenAIMultiChoice); // Original log for declaration
+
+    // Keep the added console logs for these flags immediately after their declaration for debugging.
+    console.log('[saveReply] Evaluated isDeepSeekClientParallel:', isDeepSeekClientParallel);
+    console.log('[saveReply] Evaluated isOpenAIMultiChoice:', isOpenAIMultiChoice);
+
 
     if (type != 'append' && type != 'continue' && type != 'appendFinal' && chat.length && (chat[chat.length - 1]['swipe_id'] === undefined ||
         chat[chat.length - 1]['is_user'])) {
@@ -6333,13 +6359,191 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
     let oldMessage = '';
     const generationFinished = new Date();
     const parsedImage = extractImageFromMessage(getMessage);
-    getMessage = parsedImage.getMessage;
-    if (type === 'swipe') {
+    let currentMessageContent = typeof getMessage === 'string' ? parsedImage.getMessage : '';
+    let allGeneratedMessages = [];
+    let allGeneratedExtras = [];
+
+
+    if (isDeepSeekClientParallel) {
+        console.debug('entering chat update routine for DeepSeek client-side parallel generation');
+        chat[chat.length] = {};
+        const newMessageIndex = chat.length - 1; // Defines currentMessageIndex for this block
+        chat[newMessageIndex]['extra'] = {};
+        chat[newMessageIndex]['name'] = name2; // Character name
+        chat[newMessageIndex]['is_user'] = false;
+        chat[newMessageIndex]['send_date'] = getMessageTimeStamp();
+        // API and Model are now set per choice in allGeneratedExtras, but we can set a default here from data
+        chat[newMessageIndex]['extra']['api'] = data.api || chat_completion_sources.DEEPSEEK;
+        chat[newMessageIndex]['extra']['model'] = data.model || oai_settings.deepseek_model;
+        // Global reasoning if any was passed to saveReply; individual reasoning is handled per swipe
+        chat[newMessageIndex]['extra']['reasoning'] = reasoning;
+        chat[newMessageIndex]['extra']['reasoning_duration'] = null;
+
+        // Populate allGeneratedMessages for DeepSeek parallel
+        allGeneratedMessages = data.choices.map(choice_item => {
+            // console.log('saveReply: Mapping choice_item for allGeneratedMessages (DeepSeek Parallel Path):', JSON.parse(JSON.stringify(choice_item)));
+            let content = (choice_item && choice_item.message && typeof choice_item.message.content === 'string') ? choice_item.message.content : `[Error: No content in choice ${choice_item.index}]`;
+            if (content === '' && !(choice_item && choice_item.message && typeof choice_item.message.content === 'string')) { // Check if it was explicitly empty vs not found
+                console.warn('saveReply: Received empty or non-string content from choice_item.message.content for choice (DeepSeek Parallel Path):', JSON.parse(JSON.stringify(choice_item)));
+            }
+            // console.log('saveReply: Content from choice_item.message.content (DeepSeek Parallel Path):', content);
+            return content;
+        });
+
+        // Populate allGeneratedExtras for DeepSeek parallel
+        allGeneratedExtras = data.choices.map(choice_item => {
+            const extra = {}; // Start with a fresh extra object for each swipe
+            if (choice_item && choice_item.message && typeof choice_item.message.reasoning_content === 'string') {
+                extra.reasoning = choice_item.message.reasoning_content;
+            }
+            extra.api = choice_item.api || chat_completion_sources.DEEPSEEK; // API from choice_item (set in openai.js)
+            extra.model = choice_item.model || oai_settings.deepseek_model; // Model from choice_item
+            extra.token_count = choice_item.usage?.completion_tokens || choice_item.token_count || 0;
+            extra.logprobs = choice_item.logprobs || null;
+            extra.finish_reason = choice_item.finish_reason || 'stop';
+            // Include any other fields from choice_item.extra if they exist
+            if (choice_item.extra && typeof choice_item.extra === 'object') {
+                Object.assign(extra, choice_item.extra);
+            }
+            return extra;
+        });
+        // console.log('saveReply: Populated allGeneratedExtras (DeepSeek Parallel Path):', JSON.parse(JSON.stringify(allGeneratedExtras)));
+
+        currentMessageContent = allGeneratedMessages[0]; // Use the first message as the primary
+        if (power_user.trim_spaces) {
+            currentMessageContent = currentMessageContent.trim();
+        }
+        chat[newMessageIndex]['mes'] = currentMessageContent;
+        chat[newMessageIndex]['title'] = title || data.id || ''; // Use response ID if title is missing
+        chat[newMessageIndex]['gen_started'] = generation_started;
+        chat[newMessageIndex]['gen_finished'] = generationFinished;
+
+        // Set primary message extra (reasoning & token_count) from the first choice's specific extra data
+        const primaryChoiceExtra = allGeneratedExtras[0] || {};
+        chat[newMessageIndex]['extra']['reasoning'] = primaryChoiceExtra.reasoning || reasoning; // Prefer specific, fallback to global
+        chat[newMessageIndex]['extra']['token_count'] = primaryChoiceExtra.token_count || (power_user.message_token_count_enabled ? await getTokenCountAsync((chat[newMessageIndex]['extra']['reasoning'] || '') + currentMessageContent, 0) : 0);
+        chat[newMessageIndex]['extra']['api'] = primaryChoiceExtra.api || chat[newMessageIndex]['extra']['api'];
+        chat[newMessageIndex]['extra']['model'] = primaryChoiceExtra.model || chat[newMessageIndex]['extra']['model'];
+
+
+        if (selected_group) {
+            let avatarImg = 'img/ai4.png';
+            if (characters[this_chid].avatar != 'none') {
+                avatarImg = getThumbnailUrl('avatar', characters[this_chid].avatar);
+            }
+            chat[newMessageIndex]['force_avatar'] = avatarImg;
+            chat[newMessageIndex]['original_avatar'] = characters[this_chid].avatar;
+            chat[newMessageIndex]['extra']['gen_id'] = group_generation_id;
+        }
+
+        await processImageAttachment(chat[newMessageIndex], { parsedImage, imageUrl: imageUrl });
+
+        chat[newMessageIndex]['swipe_id'] = 0;
+        chat[newMessageIndex]['swipes'] = allGeneratedMessages;
+
+        // Construct swipe_info using allGeneratedExtras
+        const baseExtraForSwipes = JSON.parse(JSON.stringify(chat[newMessageIndex].extra || {}));
+        // Ensure base API and Model are from the main data object if not overridden by choice-specific data
+        if (!baseExtraForSwipes.api) baseExtraForSwipes.api = data.api || chat_completion_sources.DEEPSEEK;
+        if (!baseExtraForSwipes.model) baseExtraForSwipes.model = data.model || oai_settings.deepseek_model;
+
+
+        chat[newMessageIndex]['swipe_info'] = await Promise.all(allGeneratedMessages.map(async (msg, i) => {
+            const choiceSpecificExtra = allGeneratedExtras[i] || {};
+            return {
+                send_date: chat[newMessageIndex]['send_date'],
+                gen_started: chat[newMessageIndex]['gen_started'],
+                gen_finished: chat[newMessageIndex]['gen_finished'],
+                extra: {
+                    ...baseExtraForSwipes,
+                    ...choiceSpecificExtra,
+                    token_count: choiceSpecificExtra.token_count || (power_user.message_token_count_enabled ? await getTokenCountAsync((choiceSpecificExtra.reasoning || baseExtraForSwipes.reasoning || '') + msg, 0) : 0),
+                },
+            };
+        }));
+        // console.log('[saveReply] DeepSeek swipe_info (constructed):', JSON.parse(JSON.stringify(chat[newMessageIndex]['swipe_info'])));
+
+        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, newMessageIndex, type);
+        // console.log('[saveReply] Before addOneMessage (DeepSeek Parallel Path):', JSON.parse(JSON.stringify(chat[newMessageIndex])));
+        addOneMessage(chat[newMessageIndex]);
+        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, newMessageIndex, type);
+
+    } else if (isOpenAIMultiChoice) {
+        // Handling for OpenAI 'n' > 1 or similar server-side multi-choice
+        console.log('[saveReply] OpenAI multi-choice (n > 1) or similar detected.');
+        chat[chat.length] = {};
+        const newMessageIndex = chat.length - 1;
+        chat[newMessageIndex]['extra'] = {};
+        chat[newMessageIndex]['name'] = name2;
+        chat[newMessageIndex]['is_user'] = false;
+        chat[newMessageIndex]['send_date'] = getMessageTimeStamp();
+        chat[newMessageIndex]['extra']['api'] = oai_settings.chat_completion_source; // API from settings
+        chat[newMessageIndex]['extra']['model'] = data.model || getGeneratingModel(); // Model from response
+        chat[newMessageIndex]['extra']['reasoning'] = reasoning; // Global reasoning for OpenAI 'n'
+        chat[newMessageIndex]['extra']['reasoning_duration'] = null;
+
+        allGeneratedMessages = data.choices.map(choice => extractMessageFromData(choice, oai_settings.chat_completion_source));
+        allGeneratedExtras = data.choices.map(choice => ({
+            // For OpenAI 'n', choices are simpler. API/Model are from the main response.
+            // Logprobs and finish_reason might be per choice.
+            logprobs: choice.logprobs || null,
+            finish_reason: choice.finish_reason || 'stop',
+            // token_count and reasoning are typically not per-choice for OpenAI 'n'
+        }));
+
+        currentMessageContent = allGeneratedMessages[0];
+        if (power_user.trim_spaces) currentMessageContent = currentMessageContent.trim();
+
+        chat[newMessageIndex]['mes'] = currentMessageContent;
+        chat[newMessageIndex]['title'] = title || data.id || ''; // Use response ID if title is missing
+        chat[newMessageIndex]['gen_started'] = generation_started;
+        chat[newMessageIndex]['gen_finished'] = generationFinished;
+
+        // For OpenAI 'n', token_count is usually on the main response (data.usage)
+        if (power_user.message_token_count_enabled) {
+            chat[newMessageIndex]['extra']['token_count'] = data.usage?.completion_tokens || await getTokenCountAsync((reasoning || '') + currentMessageContent, 0);
+        }
+
+        if (selected_group) {
+            let avatarImg = 'img/ai4.png';
+            if (characters[this_chid].avatar != 'none') avatarImg = getThumbnailUrl('avatar', characters[this_chid].avatar);
+            chat[newMessageIndex]['force_avatar'] = avatarImg;
+            chat[newMessageIndex]['original_avatar'] = characters[this_chid].avatar;
+            chat[newMessageIndex]['extra']['gen_id'] = group_generation_id;
+        }
+
+        await processImageAttachment(chat[newMessageIndex], { parsedImage, imageUrl: imageUrl });
+
+        chat[newMessageIndex]['swipe_id'] = 0;
+        chat[newMessageIndex]['swipes'] = allGeneratedMessages;
+
+        const baseExtraForSwipes = JSON.parse(JSON.stringify(chat[newMessageIndex].extra || {}));
+        // Token_count for OpenAI 'n' is typically global.
+        const globalTokenCountForSwipes = chat[newMessageIndex]['extra']['token_count'];
+
+        chat[newMessageIndex]['swipe_info'] = await Promise.all(allGeneratedMessages.map(async (msg, i) => ({
+            send_date: chat[newMessageIndex]['send_date'],
+            gen_started: chat[newMessageIndex]['gen_started'],
+            gen_finished: chat[newMessageIndex]['gen_finished'],
+            extra: {
+                ...baseExtraForSwipes,
+                ...(allGeneratedExtras[i] || {}), // Add choice-specific logprobs/finish_reason
+                token_count: globalTokenCountForSwipes || (power_user.message_token_count_enabled ? await getTokenCountAsync((baseExtraForSwipes.reasoning || '') + msg, 0) : 0),
+                reasoning: baseExtraForSwipes.reasoning || '', // Reasoning is global
+            },
+        })));
+
+        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, newMessageIndex, type);
+        // console.log('[saveReply] Before addOneMessage (OpenAI multi-choice Path):', JSON.parse(JSON.stringify(chat[newMessageIndex])));
+        addOneMessage(chat[newMessageIndex]);
+        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, newMessageIndex, type);
+
+    } else if (type === 'swipe') {
         oldMessage = chat[chat.length - 1]['mes'];
         chat[chat.length - 1]['swipes'].length++;
         if (chat[chat.length - 1]['swipe_id'] === chat[chat.length - 1]['swipes'].length - 1) {
             chat[chat.length - 1]['title'] = title;
-            chat[chat.length - 1]['mes'] = getMessage;
+            chat[chat.length - 1]['mes'] = currentMessageContent;
             chat[chat.length - 1]['gen_started'] = generation_started;
             chat[chat.length - 1]['gen_finished'] = generationFinished;
             chat[chat.length - 1]['send_date'] = getMessageTimeStamp();
@@ -6357,13 +6561,13 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             addOneMessage(chat[chat_id], { type: 'swipe' });
             await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
         } else {
-            chat[chat.length - 1]['mes'] = getMessage;
+            chat[chat.length - 1]['mes'] = currentMessageContent;
         }
     } else if (type === 'append' || type === 'continue') {
         console.debug('Trying to append.');
         oldMessage = chat[chat.length - 1]['mes'];
         chat[chat.length - 1]['title'] = title;
-        chat[chat.length - 1]['mes'] += getMessage;
+        chat[chat.length - 1]['mes'] += currentMessageContent;
         chat[chat.length - 1]['gen_started'] = generation_started;
         chat[chat.length - 1]['gen_finished'] = generationFinished;
         chat[chat.length - 1]['send_date'] = getMessageTimeStamp();
@@ -6384,7 +6588,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         oldMessage = chat[chat.length - 1]['mes'];
         console.debug('Trying to appendFinal.');
         chat[chat.length - 1]['title'] = title;
-        chat[chat.length - 1]['mes'] = getMessage;
+        chat[chat.length - 1]['mes'] = currentMessageContent;
         chat[chat.length - 1]['gen_started'] = generation_started;
         chat[chat.length - 1]['gen_finished'] = generationFinished;
         chat[chat.length - 1]['send_date'] = getMessageTimeStamp();
@@ -6397,33 +6601,35 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             const tokenCountText = (reasoning || '') + chat[chat.length - 1]['mes'];
             chat[chat.length - 1]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
         }
-        const chat_id = (chat.length - 1);
-        await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-        addOneMessage(chat[chat_id], { type: 'swipe' });
-        await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
+        const chat_id_swipe = (chat.length - 1); // Use a different variable name to avoid conflict
+        await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id_swipe, type);
+        console.log('[saveReply] Before addOneMessage (Swipe):', JSON.parse(JSON.stringify(chat[chat_id_swipe])));
+        addOneMessage(chat[chat_id_swipe], { type: 'swipe' });
+        await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id_swipe, type);
 
-    } else {
-        console.debug('entering chat update routine for non-swipe post');
+    } else { // This is the 'normal' case, or if isDeepSeekParallel was false and no other type matched
+        console.debug('entering chat update routine for non-swipe post (or non-DeepSeek parallel)');
         chat[chat.length] = {};
-        chat[chat.length - 1]['extra'] = {};
-        chat[chat.length - 1]['name'] = name2;
-        chat[chat.length - 1]['is_user'] = false;
-        chat[chat.length - 1]['send_date'] = getMessageTimeStamp();
-        chat[chat.length - 1]['extra']['api'] = getGeneratingApi();
-        chat[chat.length - 1]['extra']['model'] = getGeneratingModel();
-        chat[chat.length - 1]['extra']['reasoning'] = reasoning;
-        chat[chat.length - 1]['extra']['reasoning_duration'] = null;
+        const newMessageIndex = chat.length - 1;
+        chat[newMessageIndex]['extra'] = {};
+        chat[newMessageIndex]['name'] = name2;
+        chat[newMessageIndex]['is_user'] = false;
+        chat[newMessageIndex]['send_date'] = getMessageTimeStamp();
+        chat[newMessageIndex]['extra']['api'] = getGeneratingApi();
+        chat[newMessageIndex]['extra']['model'] = getGeneratingModel();
+        chat[newMessageIndex]['extra']['reasoning'] = reasoning;
+        chat[newMessageIndex]['extra']['reasoning_duration'] = null;
         if (power_user.trim_spaces) {
-            getMessage = getMessage.trim();
+            currentMessageContent = currentMessageContent.trim();
         }
-        chat[chat.length - 1]['mes'] = getMessage;
-        chat[chat.length - 1]['title'] = title;
-        chat[chat.length - 1]['gen_started'] = generation_started;
-        chat[chat.length - 1]['gen_finished'] = generationFinished;
+        chat[newMessageIndex]['mes'] = currentMessageContent;
+        chat[newMessageIndex]['title'] = title;
+        chat[newMessageIndex]['gen_started'] = generation_started;
+        chat[newMessageIndex]['gen_finished'] = generationFinished;
 
         if (power_user.message_token_count_enabled) {
-            const tokenCountText = (reasoning || '') + chat[chat.length - 1]['mes'];
-            chat[chat.length - 1]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
+            const tokenCountText = (reasoning || '') + chat[newMessageIndex]['mes'];
+            chat[newMessageIndex]['extra']['token_count'] = await getTokenCountAsync(tokenCountText, 0);
         }
 
         if (selected_group) {
@@ -6432,63 +6638,68 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
             if (characters[this_chid].avatar != 'none') {
                 avatarImg = getThumbnailUrl('avatar', characters[this_chid].avatar);
             }
-            chat[chat.length - 1]['force_avatar'] = avatarImg;
-            chat[chat.length - 1]['original_avatar'] = characters[this_chid].avatar;
-            chat[chat.length - 1]['extra']['gen_id'] = group_generation_id;
+            chat[newMessageIndex]['force_avatar'] = avatarImg;
+            chat[newMessageIndex]['original_avatar'] = characters[this_chid].avatar;
+            chat[newMessageIndex]['extra']['gen_id'] = group_generation_id;
         }
 
-        await processImageAttachment(chat[chat.length - 1], { parsedImage, imageUrl: imageUrl });
-        const chat_id = (chat.length - 1);
+        await processImageAttachment(chat[newMessageIndex], { parsedImage, imageUrl: imageUrl });
 
-        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, chat_id, type);
-        addOneMessage(chat[chat_id]);
-        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, chat_id, type);
-    }
-
-    const item = chat[chat.length - 1];
-    if (item['swipe_info'] === undefined) {
-        item['swipe_info'] = [];
-    }
-    if (item['swipe_id'] !== undefined) {
-        const swipeId = item['swipe_id'];
-        item['swipes'][swipeId] = item['mes'];
-        item['swipe_info'][swipeId] = {
-            send_date: item['send_date'],
-            gen_started: item['gen_started'],
-            gen_finished: item['gen_finished'],
-            extra: JSON.parse(JSON.stringify(item['extra'])),
-        };
-    } else {
-        item['swipe_id'] = 0;
-        item['swipes'] = [];
-        item['swipes'][0] = chat[chat.length - 1]['mes'];
-        item['swipe_info'][0] = {
-            send_date: chat[chat.length - 1]['send_date'],
-            gen_started: chat[chat.length - 1]['gen_started'],
-            gen_finished: chat[chat.length - 1]['gen_finished'],
-            extra: JSON.parse(JSON.stringify(chat[chat.length - 1]['extra'])),
-        };
+        !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, newMessageIndex, type);
+        console.log('[saveReply] Before addOneMessage (Normal):', JSON.parse(JSON.stringify(chat[newMessageIndex])));
+        addOneMessage(chat[newMessageIndex]);
+        !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, newMessageIndex, type);
     }
 
-    if (Array.isArray(swipes) && swipes.length > 0) {
-        const swipeInfoExtra = structuredClone(item.extra ?? {});
-        delete swipeInfoExtra.token_count;
-        delete swipeInfoExtra.reasoning;
-        delete swipeInfoExtra.reasoning_duration;
-        const swipeInfo = {
-            send_date: item.send_date,
-            gen_started: item.gen_started,
-            gen_finished: item.gen_finished,
-            extra: swipeInfoExtra,
-        };
-        const swipeInfoArray = Array(swipes.length).fill().map(() => structuredClone(swipeInfo));
-        parseReasoningInSwipes(swipes, swipeInfoArray, item.extra?.reasoning_duration);
-        item.swipes.push(...swipes);
-        item.swipe_info.push(...swipeInfoArray);
+    // Common swipe_info handling for all cases (except DeepSeekParallel which handles it above)
+    if (!isDeepSeekParallel) {
+        const item = chat[chat.length - 1];
+        if (item['swipe_info'] === undefined) {
+            item['swipe_info'] = [];
+        }
+        if (item['swipe_id'] !== undefined) {
+            const swipeId = item['swipe_id'];
+            item['swipes'][swipeId] = item['mes'];
+            item['swipe_info'][swipeId] = {
+                send_date: item['send_date'],
+                gen_started: item['gen_started'],
+                gen_finished: item['gen_finished'],
+                extra: JSON.parse(JSON.stringify(item['extra'])),
+            };
+        } else {
+            item['swipe_id'] = 0;
+            item['swipes'] = [];
+            item['swipes'][0] = chat[chat.length - 1]['mes'];
+            item['swipe_info'][0] = {
+                send_date: chat[chat.length - 1]['send_date'],
+                gen_started: chat[chat.length - 1]['gen_started'],
+                gen_finished: chat[chat.length - 1]['gen_finished'],
+                extra: JSON.parse(JSON.stringify(chat[chat.length - 1]['extra'])),
+            };
+        }
+
+        if (Array.isArray(swipes) && swipes.length > 0) {
+            const swipeInfoExtra = structuredClone(item.extra ?? {});
+            delete swipeInfoExtra.token_count;
+            delete swipeInfoExtra.reasoning;
+            delete swipeInfoExtra.reasoning_duration;
+            const swipeInfoBase = { // Renamed to avoid conflict
+                send_date: item.send_date,
+                gen_started: item.gen_started,
+                gen_finished: item.gen_finished,
+                extra: swipeInfoExtra,
+            };
+            const swipeInfoArray = Array(swipes.length).fill().map(() => structuredClone(swipeInfoBase));
+            parseReasoningInSwipes(swipes, swipeInfoArray, item.extra?.reasoning_duration);
+            item.swipes.push(...swipes);
+            item.swipe_info.push(...swipeInfoArray);
+        }
     }
+
 
     statMesProcess(chat[chat.length - 1], type, characters, this_chid, oldMessage);
-    return { type, getMessage };
+    // Return currentMessageContent for non-DeepSeek, or the first choice for DeepSeek
+    return { type, getMessage: currentMessageContent };
 }
 
 /**
