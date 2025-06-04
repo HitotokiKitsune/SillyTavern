@@ -5036,7 +5036,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @throws {Error} Throws an error if the response data contains an error message
      */
     async function onSuccess(data) { // data here is apiResponseData
-        console.log('[Generate] Received apiResponseData (should be combinedResult for DeepSeek parallel) before calling saveReply:', JSON.parse(JSON.stringify(data)));
+        console.log('[Generate] Received apiResponseData (raw):', JSON.parse(JSON.stringify(data))); // Log before cloning
+        const apiResponseDataForSaveReply = JSON.parse(JSON.stringify(data)); // Create deep clone FOR saveReply's data field
+
         if (!data) return;
 
         if (data?.fromStream) {
@@ -5057,58 +5059,59 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         //const getData = await response.json();
-        let getMessage = extractMessageFromData(data);
-        let title = extractTitleFromData(data);
-        let reasoning = extractReasoningFromData(data);
-        let imageUrl = extractImageFromData(data);
-        kobold_horde_model = title;
+        let extractedMessage = extractMessageFromData(data); // Use original 'data' for extractions
+        let extractedTitle = extractTitleFromData(data); // Use original 'data'
+        let currentReasoning = extractReasoningFromData(data); // Use original 'data'
+        let currentImageUrl = extractImageFromData(data); // Use original 'data'
+        kobold_horde_model = extractedTitle;
 
-        const swipes = extractMultiSwipes(data, type);
+        const extractedSwipes = extractMultiSwipes(data, type); // Use original 'data'
 
         messageChunk = cleanUpMessage({
-            getMessage: getMessage,
+            getMessage: extractedMessage,
             isImpersonate: isImpersonate,
             isContinue: isContinue,
             displayIncompleteSentences: false,
         });
 
 
-        reasoning = getRegexedString(reasoning, regex_placement.REASONING);
+        currentReasoning = getRegexedString(currentReasoning, regex_placement.REASONING);
 
         if (power_user.trim_spaces) {
-            reasoning = reasoning.trim();
+            currentReasoning = currentReasoning.trim();
         }
 
         if (isContinue) {
             continue_mag = promptReasoning.removePrefix(continue_mag);
-            getMessage = continue_mag + getMessage;
+            extractedMessage = continue_mag + extractedMessage;
         }
 
         //Formating
         const displayIncomplete = type === 'quiet' && !quietToLoud;
-        getMessage = cleanUpMessage({
-            getMessage: getMessage,
+        extractedMessage = cleanUpMessage({
+            getMessage: extractedMessage,
             isImpersonate: isImpersonate,
             isContinue: isContinue,
             displayIncompleteSentences: displayIncomplete,
         });
 
         if (isImpersonate) {
-            $('#send_textarea').val(getMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
+            $('#send_textarea').val(extractedMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
             generatedPromptCache = '';
-            await eventSource.emit(event_types.IMPERSONATE_READY, getMessage);
+            await eventSource.emit(event_types.IMPERSONATE_READY, extractedMessage);
         }
         else if (type == 'quiet') {
             unblockGeneration(type);
-            return getMessage;
+            return extractedMessage;
         }
         else {
             // Without streaming we'll be having a full message on continuation. Treat it as a last chunk.
+            console.log('[Generate] Calling saveReply with apiResponseDataForSaveReply:', JSON.parse(JSON.stringify(apiResponseDataForSaveReply)));
             if (originalType !== 'continue') {
-                ({ type, getMessage } = await saveReply({ type, getMessage, title, swipes, reasoning, imageUrl }));
+                ({ type, getMessage: extractedMessage } = await saveReply({ type, getMessage: extractedMessage, title: extractedTitle, swipes: extractedSwipes, reasoning: currentReasoning, imageUrl: currentImageUrl, data: apiResponseDataForSaveReply }));
             }
             else {
-                ({ type, getMessage } = await saveReply({ type: 'appendFinal', getMessage, title, swipes, reasoning, imageUrl }));
+                ({ type, getMessage: extractedMessage } = await saveReply({ type: 'appendFinal', getMessage: extractedMessage, title: extractedTitle, swipes: extractedSwipes, reasoning: currentReasoning, imageUrl: currentImageUrl, data: apiResponseDataForSaveReply }));
             }
 
             // This relies on `saveReply` having been called to add the message to the chat, so it must be last.
@@ -5117,7 +5120,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         if (canPerformToolCalls) {
             const hasToolCalls = ToolManager.hasToolCalls(data);
-            const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(getMessage);
+            const shouldDeleteMessage = type !== 'swipe' && ['', '...'].includes(extractedMessage);
             hasToolCalls && shouldDeleteMessage && await deleteLastMessage();
             const invocationResult = await ToolManager.invokeFunctionTools(data);
             const shouldStopGeneration = (!invocationResult.invocations.length && shouldDeleteMessage) || invocationResult.stealthCalls.length;
@@ -5142,7 +5145,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         const isAborted = abortController && abortController.signal.aborted;
-        if (!isAborted && power_user.auto_swipe && generatedTextFiltered(getMessage)) {
+        if (!isAborted && power_user.auto_swipe && generatedTextFiltered(extractedMessage)) {
             is_send_press = false;
             return swipe_right();
         }
@@ -5157,7 +5160,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         }
 
         // Don't break the API chain that expects a single string in return
-        return Object.defineProperty(new String(getMessage), 'messageChunk', { value: messageChunk });
+        return Object.defineProperty(new String(extractedMessage), 'messageChunk', { value: messageChunk });
     }
 
     /**
