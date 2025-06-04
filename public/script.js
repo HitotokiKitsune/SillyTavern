@@ -6656,8 +6656,8 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, newMessageIndex, type);
     }
 
-    // Common swipe_info handling for all cases (except DeepSeekParallel which handles it above)
-    if (!isDeepSeekParallel) {
+    // Common swipe_info handling for all cases (except DeepSeekClientParallel which handles it above)
+    if (!isDeepSeekClientParallel) {
         const item = chat[chat.length - 1];
         if (item['swipe_info'] === undefined) {
             item['swipe_info'] = [];
