@@ -5035,7 +5035,8 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @returns {Promise<String|{fromStream}|*|string|string|void|Awaited<*>|undefined>}
      * @throws {Error} Throws an error if the response data contains an error message
      */
-    async function onSuccess(data) {
+    async function onSuccess(data) { // data here is apiResponseData
+        console.log('[Generate] Received apiResponseData (should be combinedResult for DeepSeek parallel) before calling saveReply:', JSON.parse(JSON.stringify(data)));
         if (!data) return;
 
         if (data?.fromStream) {
@@ -6320,14 +6321,18 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
                                    data.api === chat_completion_sources.DEEPSEEK && // Check data.api (set by openai.js)
                                    oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK &&
                                    oai_settings.deepseek_parallel_generations > 1;
-    console.log('[saveReply] isDeepSeekClientParallel:', isDeepSeekClientParallel);
+    // console.log('[saveReply] isDeepSeekClientParallel:', isDeepSeekClientParallel); // Original log for declaration
 
     // Refined condition for OpenAI server-side 'n' > 1
     const isOpenAIMultiChoice = main_api === 'openai' &&
                               oai_settings.chat_completion_source !== chat_completion_sources.DEEPSEEK && // Explicitly not DeepSeek client parallel
                               Array.isArray(data?.choices) && data.choices.length > 1 &&
                               oai_settings.n > 1; // Check if the general 'n' setting is actually > 1
-    console.log('[saveReply] isOpenAIMultiChoice:', isOpenAIMultiChoice);
+    // console.log('[saveReply] isOpenAIMultiChoice:', isOpenAIMultiChoice); // Original log for declaration
+
+    // Keep the added console logs for these flags immediately after their declaration for debugging.
+    console.log('[saveReply] Evaluated isDeepSeekClientParallel:', isDeepSeekClientParallel);
+    console.log('[saveReply] Evaluated isOpenAIMultiChoice:', isOpenAIMultiChoice);
 
 
     if (type != 'append' && type != 'continue' && type != 'appendFinal' && chat.length && (chat[chat.length - 1]['swipe_id'] === undefined ||
