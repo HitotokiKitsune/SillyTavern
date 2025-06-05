@@ -6426,38 +6426,50 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         chat[newMessageIndex]['extra']['reasoning'] = reasoning;
         chat[newMessageIndex]['extra']['reasoning_duration'] = null;
 
-        // Populate allGeneratedMessages for DeepSeek parallel
-        allGeneratedMessages = data.choices.map(choice_item => {
-            let content = (choice_item && choice_item.message && typeof choice_item.message.content === 'string') ? choice_item.message.content : `[Error: No content in choice ${choice_item.index}]`;
-            if (content === '' && !(choice_item && choice_item.message && typeof choice_item.message.content === 'string')) {
-                console.warn('saveReply: Received empty or non-string content from choice_item.message.content for choice (DeepSeek Parallel Path):', JSON.parse(JSON.stringify(choice_item)));
-            }
-            return content;
-        });
+        const all_swipe_texts = [];
+        const all_swipe_extras = [];
 
-        // Populate allGeneratedExtras for DeepSeek parallel
-        allGeneratedExtras = data.choices.map(choice_item => {
-            const extra = {};
-            if (choice_item && choice_item.message && typeof choice_item.message.reasoning_content === 'string') {
-                extra.reasoning = choice_item.message.reasoning_content;
+        for (const choice_item of data.choices) {
+            let current_text = "";
+            if (choice_item?.message?.content && typeof choice_item.message.content === 'string') {
+                current_text = choice_item.message.content;
+            } else if (choice_item?.choices?.[0]?.message?.content && typeof choice_item.choices[0].message.content === 'string') {
+                current_text = choice_item.choices[0].message.content;
             }
-            extra.api = choice_item.api || chat_completion_sources.DEEPSEEK;
-            extra.model = choice_item.model || oai_settings.deepseek_model;
-            extra.token_count = choice_item.usage?.completion_tokens || choice_item.token_count || 0;
-            extra.logprobs = choice_item.logprobs || null;
-            extra.finish_reason = choice_item.finish_reason || 'stop';
-            if (choice_item.extra && typeof choice_item.extra === 'object') {
-                Object.assign(extra, choice_item.extra);
-            }
-            return extra;
-        });
 
-        let initialDisplayIndex = allGeneratedMessages.findIndex(msg => msg && msg.trim() !== "");
+            let current_reasoning = "";
+            if (choice_item?.message?.reasoning_content && typeof choice_item.message.reasoning_content === 'string') {
+                current_reasoning = choice_item.message.reasoning_content;
+            } else if (choice_item?.choices?.[0]?.message?.reasoning_content && typeof choice_item.choices[0].message.reasoning_content === 'string') {
+                current_reasoning = choice_item.choices[0].message.reasoning_content;
+            } else if (choice_item?.reasoning && typeof choice_item.reasoning === 'string') {
+                current_reasoning = choice_item.reasoning;
+            }
+
+            const choice_extra = {};
+            choice_extra.api = choice_item?.api || data.api || chat_completion_sources.DEEPSEEK;
+            choice_extra.model = choice_item?.model || data.model || oai_settings.deepseek_model;
+            choice_extra.token_count = choice_item?.usage?.completion_tokens || choice_item?.token_count || 0;
+            if (!choice_extra.token_count && power_user.message_token_count_enabled) {
+                choice_extra.token_count = await getTokenCountAsync((current_reasoning || '') + (current_text || ''), 0);
+            }
+            choice_extra.logprobs = choice_item?.logprobs || null;
+            choice_extra.finish_reason = choice_item?.finish_reason || 'stop';
+            if (choice_item?.extra && typeof choice_item.extra === 'object') {
+                Object.assign(choice_extra, choice_item.extra);
+            }
+            choice_extra.reasoning = current_reasoning; // Ensure reasoning is part of the individual swipe extra
+
+            all_swipe_texts.push(current_text);
+            all_swipe_extras.push(choice_extra);
+        }
+
+        let initialDisplayIndex = all_swipe_texts.findIndex(msg => msg && msg.trim() !== "");
         if (initialDisplayIndex === -1) {
             initialDisplayIndex = 0; // Default to 0 if all messages are empty or whitespace
         }
 
-        currentMessageContent = allGeneratedMessages[initialDisplayIndex];
+        currentMessageContent = all_swipe_texts[initialDisplayIndex] || ""; // Ensure empty string if undefined
         if (power_user.trim_spaces) {
             currentMessageContent = currentMessageContent.trim();
         }
@@ -6468,12 +6480,11 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         chat[newMessageIndex]['gen_finished'] = generationFinished;
 
         // Set primary message extra from the chosen initialDisplayIndex
-        const primaryChoiceExtra = allGeneratedExtras[initialDisplayIndex] || {};
+        const primaryChoiceExtra = all_swipe_extras[initialDisplayIndex] || {};
         chat[newMessageIndex]['extra'] = {
-            ...chat[newMessageIndex]['extra'], // Preserve existing extra fields like api, model, global reasoning
+            ...chat[newMessageIndex]['extra'], // Preserve existing extra fields
             ...primaryChoiceExtra, // Overwrite with specific extra data for the displayed message
-            // Ensure token_count is accurate for the displayed message + its specific reasoning
-            token_count: primaryChoiceExtra.token_count || (power_user.message_token_count_enabled ? await getTokenCountAsync((primaryChoiceExtra.reasoning || chat[newMessageIndex]['extra']['reasoning'] || '') + currentMessageContent, 0) : 0),
+            // Token count is already calculated and stored in primaryChoiceExtra
         };
 
 
@@ -6490,30 +6501,16 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         await processImageAttachment(chat[newMessageIndex], { parsedImage, imageUrl: imageUrl });
 
         chat[newMessageIndex]['swipe_id'] = initialDisplayIndex;
-        chat[newMessageIndex]['swipes'] = allGeneratedMessages; // Keep all generated messages
+        chat[newMessageIndex]['swipes'] = all_swipe_texts;
 
-        // Construct swipe_info using allGeneratedExtras, ensuring each swipe_info element corresponds to its message and extra
-        const baseExtraForSwipes = JSON.parse(JSON.stringify(chat[newMessageIndex].extra || {}));
-        // Remove properties that will be set by individual swipe extras to avoid incorrect carry-over
-        delete baseExtraForSwipes.reasoning;
-        delete baseExtraForSwipes.token_count;
-        delete baseExtraForSwipes.logprobs;
-        delete baseExtraForSwipes.finish_reason;
-
-
-        chat[newMessageIndex]['swipe_info'] = await Promise.all(allGeneratedMessages.map(async (msg, i) => {
-            const choiceSpecificExtra = allGeneratedExtras[i] || {};
-            return {
-                send_date: chat[newMessageIndex]['send_date'],
-                gen_started: chat[newMessageIndex]['gen_started'],
-                gen_finished: chat[newMessageIndex]['gen_finished'],
-                extra: {
-                    ...baseExtraForSwipes, // Start with common/default extras
-                    ...choiceSpecificExtra, // Override with specific extras for this swipe
-                    // Calculate token_count for this specific swipe's message and its reasoning
-                    token_count: choiceSpecificExtra.token_count || (power_user.message_token_count_enabled ? await getTokenCountAsync((choiceSpecificExtra.reasoning || '') + msg, 0) : 0),
-                },
-            };
+        chat[newMessageIndex]['swipe_info'] = all_swipe_extras.map(extra_data => ({
+            send_date: chat[newMessageIndex]['send_date'],
+            gen_started: chat[newMessageIndex]['gen_started'],
+            gen_finished: chat[newMessageIndex]['gen_finished'],
+            extra: { // Create a new object for each swipe's extra
+                ...(chat[newMessageIndex].extra || {}), // Start with common/default extras from the main message if any were set before loop
+                ...extra_data, // Override with specific extras for this swipe
+            },
         }));
 
         !fromStreaming && await eventSource.emit(event_types.MESSAGE_RECEIVED, newMessageIndex, type);
