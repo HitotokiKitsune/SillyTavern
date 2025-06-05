@@ -5079,8 +5079,8 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @throws {Error} Throws an error if the response data contains an error message
      */
     async function onSuccess(data) { // data here is apiResponseData
-if (typeof data === 'string') {
-    console.warn('Warning: onSuccess in finishGenerating was called directly with a string. This may indicate an issue with an extension or an unexpected callback. Aborting this specific call. Data (string, max 200 chars):', data.substring(0, 200));
+if (typeof data === 'string' || data instanceof String) {
+    console.warn('Warning: onSuccess in finishGenerating was called with a string primitive or String object. This may indicate an issue with an extension or an unexpected callback. Aborting this specific call. Data (first 200 chars):', data.toString().substring(0, 200));
     return; // Stop further execution of this function for this specific call
 }
         console.log('[Generate] Received apiResponseData (raw):', JSON.parse(JSON.stringify(data))); // Log before cloning
