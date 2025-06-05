@@ -4842,8 +4842,26 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
     let thisPromptBits = [];
 
     let generate_data;
-    switch (main_api) {
-        case 'koboldhorde':
+
+    if (type === 'swipe_parallel_append' && main_api === 'openai' && oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK) {
+        const currentMessageIndex = chat.length - 1; // mesId for the current message object
+        const itemizedPromptEntry = itemizedPrompts.find(p => p.mesId === currentMessageIndex);
+
+        if (!itemizedPromptEntry || !itemizedPromptEntry.rawPrompt) {
+            console.error(`swipe_parallel_append: Could not find original prompt for message index ${currentMessageIndex}. Aborting.`);
+            toastr.error(t`Could not find original prompt for regeneration. Aborting.`);
+            unblockGeneration(type);
+            // Return a rejected promise to stop further processing in Generate's call chain
+            return Promise.reject(new Error('Original prompt not found for swipe_parallel_append.'));
+        }
+        // rawPrompt for OpenAI (and thus DeepSeek) is already the array of message objects.
+        generate_data = { prompt: itemizedPromptEntry.rawPrompt };
+        console.log(`swipe_parallel_append: Using original prompt for message index ${currentMessageIndex} for DeepSeek parallel generation.`);
+        // Skip the main switch's 'openai' case for prompt assembly as we've already set generate_data.prompt.
+    } else {
+        // Existing logic for other generation types
+        switch (main_api) {
+            case 'koboldhorde':
         case 'kobold':
             if (main_api == 'koboldhorde' && horde_settings.auto_adjust_response_length) {
                 maxLength = Math.min(maxLength, adjustedParams.maxLength);
@@ -4910,7 +4928,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             break;
         }
     }
-
+    // Ensure this event is emitted even if we took the swipe_parallel_append path
     await eventSource.emit(event_types.GENERATE_AFTER_DATA, generate_data);
 
     if (dryRun) {
@@ -6385,7 +6403,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
     console.log('[saveReply] Evaluated isOpenAIMultiChoice:', isOpenAIMultiChoice);
 
 
-    if (type != 'append' && type != 'continue' && type != 'appendFinal' && chat.length && (chat[chat.length - 1]['swipe_id'] === undefined ||
+    if (type != 'append' && type != 'continue' && type != 'appendFinal' && type !== 'swipe_parallel_append' && chat.length && (chat[chat.length - 1]['swipe_id'] === undefined ||
         chat[chat.length - 1]['is_user'])) {
         type = 'normal';
     }
@@ -6422,6 +6440,7 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         // API and Model are now set per choice in allGeneratedExtras, but we can set a default here from data
         chat[newMessageIndex]['extra']['api'] = data.api || chat_completion_sources.DEEPSEEK;
         chat[newMessageIndex]['extra']['model'] = data.model || oai_settings.deepseek_model;
+        chat[newMessageIndex]['extra']['is_deepseek_parallel'] = true; // Mark as DeepSeek parallel message
         // Global reasoning if any was passed to saveReply; individual reasoning is handled per swipe
         chat[newMessageIndex]['extra']['reasoning'] = reasoning;
         chat[newMessageIndex]['extra']['reasoning_duration'] = null;
@@ -6586,6 +6605,106 @@ export async function saveReply({ type, getMessage, fromStreaming = false, title
         // console.log('[saveReply] Before addOneMessage (OpenAI multi-choice Path):', JSON.parse(JSON.stringify(chat[newMessageIndex])));
         addOneMessage(chat[newMessageIndex]);
         !fromStreaming && await eventSource.emit(event_types.CHARACTER_MESSAGE_RENDERED, newMessageIndex, type);
+
+    } else if (type === 'swipe_parallel_append') {
+        console.log('[saveReply] Handling swipe_parallel_append with data:', JSON.parse(JSON.stringify(data)));
+        const lastMessage = chat[chat.length - 1];
+
+        if (!lastMessage) {
+            console.error('swipe_parallel_append: lastMessage is undefined. Aborting.');
+            unblockGeneration('swipe_parallel_append');
+            return { type, getMessage: "" };
+        }
+
+        if (!data || !Array.isArray(data.choices) || data.choices.length === 0) {
+            console.warn('swipe_parallel_append: No new choices found in data. Aborting append.');
+            unblockGeneration('swipe_parallel_append');
+            addOneMessage(lastMessage, { type: 'swipe' }); // Re-render the current state
+            return { type, getMessage: lastMessage.mes };
+        }
+
+        const new_swipe_texts = [];
+        const new_swipe_extras_objs = [];
+        const generationFinishedTime = new Date(); // Use a consistent finish time for all new swipes from this batch
+
+        for (const choice_item of data.choices) {
+            let current_text = "";
+            if (choice_item?.message?.content && typeof choice_item.message.content === 'string') {
+                current_text = choice_item.message.content;
+            } else if (choice_item?.choices?.[0]?.message?.content && typeof choice_item.choices[0].message.content === 'string') {
+                // Handle nested choices array, e.g. from some proxy setups for 'n' > 1
+                current_text = choice_item.choices[0].message.content;
+            }
+            current_text = cleanUpMessage({ getMessage: current_text, isImpersonate: false, isContinue: false, displayIncompleteSentences: false });
+
+
+            let current_reasoning = "";
+            if (choice_item?.message?.reasoning_content && typeof choice_item.message.reasoning_content === 'string') {
+                current_reasoning = choice_item.message.reasoning_content;
+            } else if (choice_item?.choices?.[0]?.message?.reasoning_content && typeof choice_item.choices[0].message.reasoning_content === 'string') {
+                current_reasoning = choice_item.choices[0].message.reasoning_content;
+            } else if (choice_item?.reasoning && typeof choice_item.reasoning === 'string') {
+                current_reasoning = choice_item.reasoning;
+            }
+
+            const extra_for_this_swipe = {};
+            extra_for_this_swipe.api = data.api || choice_item.api || chat_completion_sources.DEEPSEEK;
+            extra_for_this_swipe.model = data.model || choice_item.model || oai_settings.deepseek_model;
+
+            let token_count_for_swipe = choice_item.usage?.completion_tokens || choice_item.token_count || 0;
+            if (!token_count_for_swipe && power_user.message_token_count_enabled) {
+                token_count_for_swipe = await getTokenCountAsync((current_reasoning || '') + (current_text || ''), 0);
+            }
+            extra_for_this_swipe.token_count = token_count_for_swipe;
+            extra_for_this_swipe.logprobs = choice_item.logprobs || null;
+            extra_for_this_swipe.finish_reason = choice_item.finish_reason || 'stop';
+            if (choice_item.extra && typeof choice_item.extra === 'object') {
+                Object.assign(extra_for_this_swipe, choice_item.extra);
+            }
+            extra_for_this_swipe.reasoning = current_reasoning;
+
+            new_swipe_texts.push(current_text);
+            new_swipe_extras_objs.push(extra_for_this_swipe);
+        }
+
+        if (new_swipe_texts.length === 0) {
+            console.warn('swipe_parallel_append: Processed choices but no swipe texts were generated.');
+            unblockGeneration('swipe_parallel_append');
+            addOneMessage(lastMessage, { type: 'swipe' }); // Re-render
+            return { type, getMessage: lastMessage.mes };
+        }
+
+        const original_num_swipes = lastMessage.swipes.length;
+        lastMessage.swipes.push(...new_swipe_texts);
+
+        for (const extra_obj of new_swipe_extras_objs) {
+            lastMessage.swipe_info.push({
+                send_date: lastMessage.send_date, // Or getMessageTimeStamp() if each should be unique
+                gen_started: generation_started, // Global generation_started from the Generate call
+                gen_finished: generationFinishedTime,
+                extra: extra_obj,
+            });
+        }
+
+        lastMessage.swipe_id = original_num_swipes; // Set to the first newly added swipe
+
+        // Update Main Message Display Fields
+        lastMessage.mes = lastMessage.swipes[lastMessage.swipe_id];
+        // Deep clone and merge. Prioritize new swipe's specific extra over older lastMessage.extra.
+        // However, ensure is_deepseek_parallel and original API/model for the message itself are preserved if not in swipe_info.extra
+        const baseExtra = {
+            is_deepseek_parallel: lastMessage.extra.is_deepseek_parallel,
+            api: lastMessage.extra.api,
+            model: lastMessage.extra.model
+        };
+        lastMessage.extra = { ...baseExtra, ...(lastMessage.swipe_info[lastMessage.swipe_id].extra || {}) };
+        lastMessage.gen_finished = generationFinishedTime;
+        lastMessage.title = data.id || lastMessage.title; // Update with new batch ID if available
+
+        addOneMessage(lastMessage, { type: 'swipe' });
+        saveChatConditional();
+        unblockGeneration('swipe_parallel_append');
+        return { type, getMessage: lastMessage.mes };
 
     } else if (type === 'swipe') {
         oldMessage = chat[chat.length - 1]['mes'];
@@ -9668,9 +9787,24 @@ export function swipe_right(_event, { source, repeated } = {}) {
     }
     //console.log(chat[chat.length-1]['swipes']);
     if (parseInt(chat[chat.length - 1]['swipe_id']) === chat[chat.length - 1]['swipes'].length && chat.length !== 1) { //if swipe id of last message is the same as the length of the 'swipes' array and not the greeting
-        delete chat[chat.length - 1].gen_started;
-        delete chat[chat.length - 1].gen_finished;
-        run_generate = true;
+        const currentMessage = chat[chat.length - 1];
+        const isDeepSeek = main_api === 'openai' && oai_settings.chat_completion_source === chat_completion_sources.DEEPSEEK;
+        const isParallelEnabled = parseInt(oai_settings.deepseek_parallel_generations, 10) > 1;
+        const messageWasFromDeepSeekParallel = currentMessage.extra && currentMessage.extra.is_deepseek_parallel === true;
+
+        if (isDeepSeek && isParallelEnabled && messageWasFromDeepSeekParallel) {
+            console.log(`DeepSeek Additive Parallel Swipes triggered for message ${chat.length - 1}`);
+            // is_send_press will be set by Generate()
+            // Generate will handle fetching the original prompt based on the current message context.
+            Generate('swipe_parallel_append');
+            // run_generate will be false, so the normal "..." display path is taken.
+            // The actual text update (adding N new swipes) will happen in saveReply in a later step.
+            run_generate = false;
+        } else {
+            delete chat[chat.length - 1].gen_started;
+            delete chat[chat.length - 1].gen_finished;
+            run_generate = true;
+        }
     } else if (parseInt(chat[chat.length - 1]['swipe_id']) < chat[chat.length - 1]['swipes'].length) { //otherwise, if the id is less than the number of swipes
         chat[chat.length - 1]['mes'] = chat[chat.length - 1]['swipes'][chat[chat.length - 1]['swipe_id']]; //load the last mes box with the latest generation
         chat[chat.length - 1]['send_date'] = chat[chat.length - 1]?.swipe_info[chat[chat.length - 1]['swipe_id']]?.send_date || chat[chat.length - 1]['send_date']; //update send date
@@ -9758,11 +9892,19 @@ export function swipe_right(_event, { source, repeated } = {}) {
                             queue: false,
                             complete: async function () {
                                 await eventSource.emit(event_types.MESSAGE_SWIPED, (chat.length - 1));
+                                // run_generate is true for normal new swipes, false for swipe_parallel_append
                                 if (run_generate && !is_send_press && parseInt(chat[chat.length - 1]['swipe_id']) === chat[chat.length - 1]['swipes'].length) {
-                                    console.debug('caught here 2');
-                                    is_send_press = true;
+                                    console.debug('swipe_right: caught generate normal swipe');
+                                    // is_send_press will be set by Generate()
                                     await Generate('swipe');
-                                } else {
+                                } else if (!run_generate && is_send_press) {
+                                    // This case handles when swipe_parallel_append was triggered.
+                                    // is_send_press is true because Generate('swipe_parallel_append') was called.
+                                    // We are waiting for saveReply to handle the result.
+                                    console.debug('swipe_right: waiting for swipe_parallel_append generation to complete.');
+                                }
+                                 else {
+                                    // This handles cases where we swiped to an existing message, not generating a new one.
                                     if (parseInt(chat[chat.length - 1]['swipe_id']) !== chat[chat.length - 1]['swipes'].length) {
                                         saveChatDebounced();
                                     }
