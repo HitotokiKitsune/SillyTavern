@@ -5036,8 +5036,8 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
      * @throws {Error} Throws an error if the response data contains an error message
      */
     async function onSuccess(data) { // data here is apiResponseData
-        console.log('[Generate] Received apiResponseData (raw):', JSON.parse(JSON.stringify(data))); // Log before cloning
-        const apiResponseDataForSaveReply = JSON.parse(JSON.stringify(data)); // Create deep clone FOR saveReply's data field
+        console.log('[Generate] Received apiResponseData (raw):', data); // Log before cloning
+        const apiResponseDataForSaveReply = data; // Create deep clone FOR saveReply's data field
 
         if (!data) return;
 
